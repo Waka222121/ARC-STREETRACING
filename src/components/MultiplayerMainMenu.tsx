@@ -607,21 +607,7 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
             </button>
           </div>
 
-          {/* MODE DESCRIPTION / ROOM CODE CONTROLS */}
-          {activeTab === 'quick_match' && (
-            <div>
-              <span className="block font-['Space_Mono',monospace] text-[0.6rem] uppercase opacity-40">
-                Live Human Matchmaking (Zero AI Bots)
-              </span>
-              <p className="mt-1 text-[0.76rem] leading-relaxed opacity-80">
-                {roomState
-                  ? roomState.status === 'countdown'
-                    ? `All ${roomState.stakedCount} players locked in! Race starts in ${countdownSec ?? 3}s...`
-                    : `Connected to Live Room #${roomState.roomCode} (${roomState.connectedCount}/4 humans). Race launches as soon as 2+ connected players lock stakes.`
-                  : 'Join a live public highway lobby with 2 to 4 human drivers. Winner takes the entire USDC pot.'}
-              </p>
-            </div>
-          )}
+          {/* ROOM CODE CONTROLS */}
 
           {activeTab === 'create_room' && (
             <div className="flex flex-col gap-2">
