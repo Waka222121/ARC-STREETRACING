@@ -16,10 +16,12 @@ import {
   calculateTargetRoundForRequest,
   computeWagerBreakdown,
   connectInjectedArcWallet,
+  connectLinkedArcAddress,
   createDisconnectedArcWallet,
   deriveWinnerLaneFromRandomness,
   disconnectArcWallet,
   DiscoveredWalletProvider,
+  fetchArcTestnetUsdcBalance,
   loadEmbeddedArcWallet,
   refreshInjectedArcWallet,
   resolveOrionBeaconRandomness,
@@ -29,6 +31,7 @@ import {
   submitInjectedOrionRequest,
   subscribeDiscoveredWallets,
   subscribeInjectedWalletEvents,
+  switchConnectedWalletToArcTestnet,
 } from './game/arcOrionClient';
 import { soundEngine } from './game/audio';
 import { resolveUniqueLanePaintColors } from './game/physics';
@@ -248,9 +251,15 @@ export default function App() {
         );
         const connected = await connectInjectedArcWallet(selected);
         setArcWallet(connected);
-        setWalletStatusMessage(
-          `Connected ${connected.providerName ?? 'Wallet'} on Arc Testnet`,
-        );
+        if (connected.chainId !== ARC_TESTNET_CHAIN_ID) {
+          setWalletStatusMessage(
+            `Connected ${connected.providerName ?? 'Wallet'} — click "Switch to Arc" to switch to Arc Testnet (${ARC_TESTNET_CHAIN_ID}).`,
+          );
+        } else {
+          setWalletStatusMessage(
+            `Connected ${connected.providerName ?? 'Wallet'} on Arc Testnet`,
+          );
+        }
       } catch (err) {
         const msg =
           err instanceof Error
@@ -261,6 +270,47 @@ export default function App() {
     },
     [],
   );
+
+  const handleConnectLinkedAddress = useCallback(async (rawAddress: string) => {
+    setWalletStatusMessage('Checking Arc Testnet balance...');
+    const linked = await connectLinkedArcAddress(rawAddress);
+    setArcWallet(linked);
+    setWalletStatusMessage('Bound personal Arc Testnet address');
+  }, []);
+
+  const handleSwitchToArcTestnet = useCallback(async () => {
+    if (arcWallet.mode !== 'injected_eip1193' || !arcWallet.address) return;
+    setWalletStatusMessage(
+      `Switching wallet to Arc Testnet (${ARC_TESTNET_CHAIN_ID})...`,
+    );
+    const updated = await switchConnectedWalletToArcTestnet(arcWallet.address);
+    if (updated) {
+      setArcWallet(updated);
+      setWalletStatusMessage(
+        updated.chainId === ARC_TESTNET_CHAIN_ID
+          ? `Switched to Arc Testnet (${ARC_TESTNET_CHAIN_ID})`
+          : `Could not switch automatically — select Arc Testnet (${ARC_TESTNET_CHAIN_ID}) in your wallet.`,
+      );
+    }
+  }, [arcWallet.mode, arcWallet.address]);
+
+  const handleRefreshWalletBalance = useCallback(async () => {
+    if (!arcWallet.address) return;
+    if (arcWallet.mode === 'injected_eip1193') {
+      const updated = await refreshInjectedArcWallet(arcWallet.address);
+      if (updated) setArcWallet(updated);
+    } else if (arcWallet.mode === 'linked_address') {
+      const { amount6, rawGas18 } = await fetchArcTestnetUsdcBalance(
+        arcWallet.address,
+      );
+      setArcWallet((prev) => ({
+        ...prev,
+        balanceUsdc: amount6.toFixed(2),
+        balanceRawUsdc6: amount6.raw,
+        balanceRawGas18: rawGas18,
+      }));
+    }
+  }, [arcWallet.mode, arcWallet.address]);
 
   const handleDisconnectWallet = useCallback(() => {
     setArcWallet(disconnectArcWallet());
@@ -313,9 +363,9 @@ export default function App() {
 
         if (arcWallet.balanceRawUsdc6 < breakdown.playerTotalLockUsdc.raw) {
           setWalletStatusMessage(
-            arcWallet.mode === 'injected_eip1193'
-              ? 'Insufficient Arc Testnet USDC — top up via Arc Testnet Faucet or play Free ($0).'
-              : 'Insufficient Demo USDC balance — click +50 USDC to top up.',
+            arcWallet.mode === 'embedded_arc'
+              ? 'Insufficient Demo USDC balance — click +50 USDC to top up.'
+              : 'Insufficient Arc Testnet USDC — claim free test USDC at faucet.circle.com or play Free ($0).',
           );
           return;
         }
@@ -334,7 +384,7 @@ export default function App() {
             void refreshInjectedArcWallet(arcWallet.address).then((updated) => {
               if (updated) setArcWallet(updated);
             });
-          } else {
+          } else if (arcWallet.mode === 'embedded_arc') {
             const updatedWallet = saveEmbeddedArcBalance(
               arcWallet.balanceRawUsdc6 - breakdown.playerTotalLockUsdc.raw,
             );
@@ -530,6 +580,9 @@ export default function App() {
           stakeTierUsdc={stakeTierUsdc}
           onSelectStakeTier={setStakeTierUsdc}
           onConnectInjectedWallet={handleConnectInjectedWallet}
+          onConnectLinkedAddress={handleConnectLinkedAddress}
+          onSwitchToArcTestnet={handleSwitchToArcTestnet}
+          onRefreshWalletBalance={handleRefreshWalletBalance}
           onDisconnectWallet={handleDisconnectWallet}
           onSwitchToEmbeddedWallet={handleSwitchToEmbeddedWallet}
           onFaucetTopUpUsdc={handleFaucetTopUpUsdc}

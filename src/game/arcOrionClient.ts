@@ -2,6 +2,7 @@ import {
   ARC_TESTNET_CHAIN_ID,
   buildAddressExplorerUrl,
   buildTxExplorerUrl,
+  getUsdc,
   ORION_DEMO_V2_ADDRESS,
   ORION_HUB_V2_ADDRESS,
   requireChain,
@@ -20,6 +21,7 @@ export const DRAND_PERIOD = 3n;
 export const ORION_MIN_DELAY_PERIODS = 3n;
 export const ORION_MIN_REWARD_USDC = '0.01';
 export const DEFAULT_RELAYER_REWARD_USDC = '0.02';
+export const ARC_TESTNET_FAUCET_URL = 'https://faucet.circle.com';
 
 export type StakeTierUsdc = string;
 
@@ -30,7 +32,11 @@ export const STAKE_TIERS_USDC: readonly string[] = [
   '25',
 ];
 
-export type WalletMode = 'disconnected' | 'embedded_arc' | 'injected_eip1193';
+export type WalletMode =
+  | 'disconnected'
+  | 'embedded_arc'
+  | 'injected_eip1193'
+  | 'linked_address';
 
 export interface ArcWalletState {
   mode: WalletMode;
@@ -198,6 +204,26 @@ export function formatUsdcDisplay(amount6: Amount): string {
 }
 
 /**
+ * Detects whether the app is running inside a cross-origin iframe (such as AI Studio Preview),
+ * where browser wallet extensions (MetaMask/Rabby) cannot inject window.ethereum.
+ */
+export function isRunningInIframe(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Validates an EVM 20-byte hex address (`0x` + 40 hex chars).
+ */
+export function isValidEvmAddress(addr: string): boolean {
+  return /^0x[0-9a-fA-F]{40}$/.test((addr || '').trim());
+}
+
+/**
  * Returns a clean disconnected wallet state so each public player connects their own personal wallet.
  */
 export function createDisconnectedArcWallet(): ArcWalletState {
@@ -290,12 +316,14 @@ export interface Eip1193Provider {
     event: string,
     listener: (...args: unknown[]) => void,
   ) => void;
+  providers?: Eip1193Provider[];
   isMetaMask?: boolean;
   isRabby?: boolean;
   isCoinbaseWallet?: boolean;
   isPhantom?: boolean;
   isOkxWallet?: boolean;
   isTrust?: boolean;
+  isBraveWallet?: boolean;
 }
 
 export interface DiscoveredWalletProvider {
@@ -308,24 +336,71 @@ export interface DiscoveredWalletProvider {
 
 const WALLET_DISCONNECTED_FLAG_KEY = 'arc_wallet_explicit_disconnect_v1';
 const WALLET_LAST_RDNS_KEY = 'arc_wallet_last_rdns_v1';
+const WALLET_LINKED_ADDRESS_KEY = 'arc_wallet_linked_address_v1';
 
 let activeInjectedProvider: Eip1193Provider | null = null;
 let activeInjectedProviderName: string | undefined = undefined;
 
 function inferInjectedProviderName(provider: Eip1193Provider): string {
-  if (provider.isRabby) return 'Rabby';
+  if (provider.isRabby) return 'Rabby Wallet';
   if (provider.isCoinbaseWallet) return 'Coinbase Wallet';
   if (provider.isPhantom) return 'Phantom';
   if (provider.isOkxWallet) return 'OKX Wallet';
   if (provider.isTrust) return 'Trust Wallet';
+  if (provider.isBraveWallet) return 'Brave Wallet';
   if (provider.isMetaMask) return 'MetaMask';
   return 'Browser Wallet';
 }
 
+function collectLegacyInjectedProviders(): DiscoveredWalletProvider[] {
+  if (typeof window === 'undefined') return [];
+  const win = window as unknown as {
+    ethereum?: Eip1193Provider;
+    rabby?: Eip1193Provider;
+    okxwallet?: Eip1193Provider;
+    phantom?: { ethereum?: Eip1193Provider };
+  };
+
+  const rawProviders: Eip1193Provider[] = [];
+  if (win.ethereum) {
+    if (Array.isArray(win.ethereum.providers) && win.ethereum.providers.length > 0) {
+      rawProviders.push(...win.ethereum.providers);
+    } else {
+      rawProviders.push(win.ethereum);
+    }
+  }
+  if (win.rabby && typeof win.rabby.request === 'function') {
+    rawProviders.push(win.rabby);
+  }
+  if (win.okxwallet && typeof win.okxwallet.request === 'function') {
+    rawProviders.push(win.okxwallet);
+  }
+  if (win.phantom?.ethereum && typeof win.phantom.ethereum.request === 'function') {
+    rawProviders.push(win.phantom.ethereum);
+  }
+
+  const seenProviders = new Set<Eip1193Provider>();
+  const discovered: DiscoveredWalletProvider[] = [];
+
+  for (const p of rawProviders) {
+    if (!p || typeof p.request !== 'function' || seenProviders.has(p)) continue;
+    seenProviders.add(p);
+    const name = inferInjectedProviderName(p);
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '.');
+    discovered.push({
+      uuid: `legacy-${slug}-${discovered.length}`,
+      name,
+      rdns: `injected.${slug}`,
+      provider: p,
+    });
+  }
+
+  return discovered;
+}
+
 function getFallbackInjectedProvider(): Eip1193Provider | null {
-  if (typeof window === 'undefined') return null;
-  const anyWin = window as unknown as { ethereum?: Eip1193Provider };
-  return anyWin.ethereum ?? null;
+  const list = collectLegacyInjectedProviders();
+  return list[0]?.provider ?? null;
 }
 
 function getActiveInjectedProvider(): Eip1193Provider | null {
@@ -333,33 +408,40 @@ function getActiveInjectedProvider(): Eip1193Provider | null {
 }
 
 /**
- * Subscribes to EIP-6963 multi-wallet announcements (MetaMask, Rabby, Coinbase, Phantom, OKX, etc.)
- * and falls back to `window.ethereum` if no EIP-6963 providers announce themselves.
+ * Triggers a fresh EIP-6963 announcement scan (`eip6963:requestProvider`) for late-injected wallets.
+ */
+export function triggerWalletDiscoveryScan(): void {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new Event('eip6963:requestProvider'));
+}
+
+/**
+ * Subscribes to EIP-6963 multi-wallet announcements (MetaMask, Rabby, Coinbase, Phantom, OKX, etc.),
+ * merges legacy `window.ethereum.providers` / wallet namespaces, and runs delayed rescans for async injections.
  */
 export function subscribeDiscoveredWallets(
   onUpdate: (wallets: DiscoveredWalletProvider[]) => void,
 ): () => void {
   if (typeof window === 'undefined') return () => {};
 
-  const byKey = new Map<string, DiscoveredWalletProvider>();
+  const eip6963Map = new Map<string, DiscoveredWalletProvider>();
 
   const emit = () => {
-    const list = Array.from(byKey.values());
-    if (list.length === 0) {
-      const fallback = getFallbackInjectedProvider();
-      if (fallback) {
-        onUpdate([
-          {
-            uuid: 'injected-window-ethereum',
-            name: inferInjectedProviderName(fallback),
-            rdns: 'window.ethereum',
-            provider: fallback,
-          },
-        ]);
-        return;
+    const merged: DiscoveredWalletProvider[] = Array.from(eip6963Map.values());
+    const knownProviders = new Set(merged.map((w) => w.provider));
+    const knownNames = new Set(merged.map((w) => w.name.toLowerCase()));
+
+    for (const legacy of collectLegacyInjectedProviders()) {
+      if (
+        !knownProviders.has(legacy.provider) &&
+        !knownNames.has(legacy.name.toLowerCase())
+      ) {
+        merged.push(legacy);
+        knownProviders.add(legacy.provider);
+        knownNames.add(legacy.name.toLowerCase());
       }
     }
-    onUpdate(list);
+    onUpdate(merged);
   };
 
   const onAnnounce = (event: Event) => {
@@ -371,7 +453,7 @@ export function subscribeDiscoveredWallets(
     const provider = custom.detail?.provider;
     if (!info || !provider || typeof provider.request !== 'function') return;
     const key = info.rdns || info.uuid || info.name || 'wallet';
-    byKey.set(key, {
+    eip6963Map.set(key, {
       uuid: info.uuid || key,
       name: info.name || inferInjectedProviderName(provider),
       rdns: info.rdns || key,
@@ -385,9 +467,99 @@ export function subscribeDiscoveredWallets(
   window.dispatchEvent(new Event('eip6963:requestProvider'));
   emit();
 
+  // Some extensions (e.g. Rabby / OKX / mobile Web3 browsers) inject slightly after first paint
+  const rescan1 = window.setTimeout(() => {
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+    emit();
+  }, 350);
+  const rescan2 = window.setTimeout(() => {
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+    emit();
+  }, 1200);
+
   return () => {
     window.removeEventListener('eip6963:announceProvider', onAnnounce);
+    window.clearTimeout(rescan1);
+    window.clearTimeout(rescan2);
   };
+}
+
+/**
+ * Fetches an address's live Arc Testnet (`5042002`) USDC balance directly via Arc RPC
+ * (`onchain-facts.ts` -> `requireChain(5042002).rpcUrls` + `getUsdc(5042002)`),
+ * safely bridging 18-decimal native gas USDC <-> 6-decimal ERC-20 USDC via `onchain-money.ts`.
+ */
+export async function fetchArcTestnetUsdcBalance(
+  address: string,
+): Promise<{ amount6: Amount; rawGas18: bigint }> {
+  const chainFact = requireChain(ARC_TESTNET_CHAIN_ID);
+  const usdcToken = getUsdc(ARC_TESTNET_CHAIN_ID);
+  const rpcCandidates = [
+    ...chainFact.rpcUrls,
+    'https://rpc.drpc.testnet.arc.io',
+    'https://rpc.solidrpc.io/public/evm/5042002',
+  ];
+
+  const cleanAddr = address.trim().toLowerCase().replace(/^0x/, '');
+  const balanceOfData = `0x70a08231${cleanAddr.padStart(64, '0')}`;
+
+  for (const rpcUrl of rpcCandidates) {
+    try {
+      // Query native 18-decimal USDC balance on Arc Testnet
+      const nativeRes = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'eth_getBalance',
+          params: [address, 'latest'],
+        }),
+        signal: AbortSignal.timeout(4500),
+      });
+
+      if (nativeRes.ok) {
+        const json = (await nativeRes.json()) as { result?: string };
+        if (json.result && json.result.startsWith('0x')) {
+          const rawGas18 = BigInt(json.result);
+          const amount6 = gasTokenToUsdc(
+            ARC_TESTNET_CHAIN_ID,
+            Amount.fromRaw(rawGas18, 18),
+            'trunc',
+          );
+          return { amount6, rawGas18 };
+        }
+      }
+
+      // Fallback: query 6-decimal ERC-20 USDC interface at 0x3600...0000
+      if (usdcToken) {
+        const erc20Res = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 2,
+            method: 'eth_call',
+            params: [{ to: usdcToken.address, data: balanceOfData }, 'latest'],
+          }),
+          signal: AbortSignal.timeout(4500),
+        });
+        if (erc20Res.ok) {
+          const json = (await erc20Res.json()) as { result?: string };
+          if (json.result && json.result !== '0x') {
+            const raw6 = BigInt(json.result);
+            const amount6 = Amount.fromRaw(raw6, usdcToken.decimals);
+            const amount18 = usdcToGasToken(ARC_TESTNET_CHAIN_ID, amount6);
+            return { amount6, rawGas18: amount18.raw };
+          }
+        }
+      }
+    } catch {
+      // Try next Arc Testnet RPC endpoint
+    }
+  }
+
+  return { amount6: Amount.zero(6), rawGas18: 0n };
 }
 
 async function readArcWalletStateFromProvider(
@@ -395,11 +567,6 @@ async function readArcWalletStateFromProvider(
   address: string,
   providerName?: string,
 ): Promise<ArcWalletState> {
-  const balanceHex = (await provider.request({
-    method: 'eth_getBalance',
-    params: [address, 'latest'],
-  })) as string;
-
   let currentChainId = ARC_TESTNET_CHAIN_ID;
   try {
     const chainHex = (await provider.request({
@@ -412,9 +579,33 @@ async function readArcWalletStateFromProvider(
     currentChainId = ARC_TESTNET_CHAIN_ID;
   }
 
-  const rawGas18 = BigInt(balanceHex || '0x0');
-  const gasAmount18 = Amount.fromRaw(rawGas18, 18);
-  const usdcAmount6 = gasTokenToUsdc(ARC_TESTNET_CHAIN_ID, gasAmount18, 'trunc');
+  // Always read the true Arc Testnet (5042002) USDC balance:
+  // if the wallet is on Arc Testnet, try provider first, else fall back directly to Arc Testnet RPC.
+  let rawGas18 = 0n;
+  let usdcAmount6 = Amount.zero(6);
+
+  if (currentChainId === ARC_TESTNET_CHAIN_ID) {
+    try {
+      const balanceHex = (await provider.request({
+        method: 'eth_getBalance',
+        params: [address, 'latest'],
+      })) as string;
+      rawGas18 = BigInt(balanceHex || '0x0');
+      usdcAmount6 = gasTokenToUsdc(
+        ARC_TESTNET_CHAIN_ID,
+        Amount.fromRaw(rawGas18, 18),
+        'trunc',
+      );
+    } catch {
+      const live = await fetchArcTestnetUsdcBalance(address);
+      usdcAmount6 = live.amount6;
+      rawGas18 = live.rawGas18;
+    }
+  } else {
+    const live = await fetchArcTestnetUsdcBalance(address);
+    usdcAmount6 = live.amount6;
+    rawGas18 = live.rawGas18;
+  }
 
   return {
     mode: 'injected_eip1193',
@@ -428,38 +619,81 @@ async function readArcWalletStateFromProvider(
   };
 }
 
-async function ensureArcTestnetChain(provider: Eip1193Provider): Promise<void> {
+/**
+ * Switches or adds Arc Testnet (`chainId: 5042002`) in the user's EVM wallet using Arc Studio `onchain-facts.ts`.
+ */
+export async function ensureArcTestnetChain(
+  provider: Eip1193Provider,
+): Promise<boolean> {
   const chainFact = requireChain(ARC_TESTNET_CHAIN_ID);
   const hexChainId = `0x${ARC_TESTNET_CHAIN_ID.toString(16)}`;
+
+  try {
+    const currentHex = (await provider.request({
+      method: 'eth_chainId',
+    })) as string;
+    if (currentHex && Number.parseInt(currentHex, 16) === ARC_TESTNET_CHAIN_ID) {
+      return true;
+    }
+  } catch {
+    // Proceed to switch request
+  }
 
   try {
     await provider.request({
       method: 'wallet_switchEthereumChain',
       params: [{ chainId: hexChainId }],
     });
-  } catch {
-    await provider.request({
-      method: 'wallet_addEthereumChain',
-      params: [
-        {
-          chainId: hexChainId,
-          chainName: chainFact.name,
-          nativeCurrency: {
-            name: 'USDC',
-            symbol: chainFact.nativeCurrency.symbol,
-            decimals: chainFact.nativeCurrency.decimals,
+    return true;
+  } catch (err) {
+    const code = (err as { code?: number })?.code;
+    // 4001 = User explicitly rejected network switch
+    if (code === 4001) {
+      return false;
+    }
+    try {
+      await provider.request({
+        method: 'wallet_addEthereumChain',
+        params: [
+          {
+            chainId: hexChainId,
+            chainName: chainFact.name,
+            nativeCurrency: {
+              name: 'USDC',
+              symbol: chainFact.nativeCurrency.symbol,
+              decimals: chainFact.nativeCurrency.decimals,
+            },
+            rpcUrls: chainFact.rpcUrls,
+            blockExplorerUrls: [chainFact.explorerBase],
           },
-          rpcUrls: chainFact.rpcUrls,
-          blockExplorerUrls: [chainFact.explorerBase],
-        },
-      ],
-    });
+        ],
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
 /**
+ * Switches the currently connected browser wallet to Arc Testnet (5042002) and refreshes its balance.
+ */
+export async function switchConnectedWalletToArcTestnet(
+  address: string,
+): Promise<ArcWalletState | null> {
+  const provider = getActiveInjectedProvider();
+  if (!provider || !address) return null;
+  await ensureArcTestnetChain(provider);
+  return readArcWalletStateFromProvider(
+    provider,
+    address,
+    activeInjectedProviderName,
+  );
+}
+
+/**
  * Connects to the user's own EIP-6963 or EIP-1193 wallet (MetaMask, Rabby, Coinbase, Phantom, OKX, etc.),
- * switches/adds Arc Testnet (5042002), and reads their live native 18-decimal USDC balance.
+ * attempts to switch/add Arc Testnet (5042002), and reads their live Arc Testnet USDC balance.
  */
 export async function connectInjectedArcWallet(
   selected?: DiscoveredWalletProvider,
@@ -467,7 +701,9 @@ export async function connectInjectedArcWallet(
   const provider = selected?.provider ?? getActiveInjectedProvider();
   if (!provider) {
     throw new Error(
-      'No browser wallet detected. Install MetaMask or Rabby, or use Demo Wallet.',
+      isRunningInIframe()
+        ? 'Browser extensions cannot run inside preview iframe. Open in a new tab or bind your 0x Arc address.'
+        : 'No browser wallet detected. Install MetaMask or Rabby, or bind your 0x Arc address.',
     );
   }
 
@@ -479,6 +715,7 @@ export async function connectInjectedArcWallet(
   }
   const address = accounts[0];
 
+  // Attempt automatic switch/add to Arc Testnet (5042002), without blocking connection if user cancels
   await ensureArcTestnetChain(provider);
 
   const name = selected?.name ?? inferInjectedProviderName(provider);
@@ -487,6 +724,7 @@ export async function connectInjectedArcWallet(
 
   try {
     localStorage.removeItem(WALLET_DISCONNECTED_FLAG_KEY);
+    localStorage.removeItem(WALLET_LINKED_ADDRESS_KEY);
     if (selected?.rdns) {
       localStorage.setItem(WALLET_LAST_RDNS_KEY, selected.rdns);
     }
@@ -498,8 +736,44 @@ export async function connectInjectedArcWallet(
 }
 
 /**
+ * Binds a player's own personal Arc Testnet `0x...` address directly and reads their live on-chain
+ * USDC balance from `https://rpc.testnet.arc.io` (works even inside iframes or browsers without extensions).
+ */
+export async function connectLinkedArcAddress(
+  rawAddress: string,
+): Promise<ArcWalletState> {
+  const trimmed = rawAddress.trim();
+  if (!isValidEvmAddress(trimmed)) {
+    throw new Error('Enter a valid 0x EVM wallet address (42 characters).');
+  }
+
+  const { amount6, rawGas18 } = await fetchArcTestnetUsdcBalance(trimmed);
+
+  activeInjectedProvider = null;
+  activeInjectedProviderName = undefined;
+
+  try {
+    localStorage.removeItem(WALLET_DISCONNECTED_FLAG_KEY);
+    localStorage.setItem(WALLET_LINKED_ADDRESS_KEY, trimmed);
+  } catch {
+    // Ignore storage errors
+  }
+
+  return {
+    mode: 'linked_address',
+    address: trimmed,
+    chainId: ARC_TESTNET_CHAIN_ID,
+    balanceUsdc: amount6.toFixed(2),
+    balanceRawUsdc6: amount6.raw,
+    balanceRawGas18: rawGas18,
+    isConnected: true,
+    providerName: 'Arc Address',
+  };
+}
+
+/**
  * Silently restores an already-authorized browser wallet session via `eth_accounts`
- * (never triggers a wallet popup). Returns null if disconnected or unauthorized.
+ * or a previously bound personal Arc address. Never triggers a wallet popup.
  */
 export async function restoreInjectedArcWallet(
   discovered: DiscoveredWalletProvider[] = [],
@@ -513,10 +787,13 @@ export async function restoreInjectedArcWallet(
   }
 
   let preferredRdns: string | null = null;
+  let savedLinkedAddress: string | null = null;
   try {
     preferredRdns = localStorage.getItem(WALLET_LAST_RDNS_KEY);
+    savedLinkedAddress = localStorage.getItem(WALLET_LINKED_ADDRESS_KEY);
   } catch {
     preferredRdns = null;
+    savedLinkedAddress = null;
   }
 
   const orderedCandidates: Array<{ provider: Eip1193Provider; name: string }> = [];
@@ -531,12 +808,10 @@ export async function restoreInjectedArcWallet(
       orderedCandidates.push({ provider: w.provider, name: w.name });
     }
   }
-  const fallback = getFallbackInjectedProvider();
-  if (fallback && !orderedCandidates.some((c) => c.provider === fallback)) {
-    orderedCandidates.push({
-      provider: fallback,
-      name: inferInjectedProviderName(fallback),
-    });
+  for (const legacy of collectLegacyInjectedProviders()) {
+    if (!orderedCandidates.some((c) => c.provider === legacy.provider)) {
+      orderedCandidates.push({ provider: legacy.provider, name: legacy.name });
+    }
   }
 
   for (const candidate of orderedCandidates) {
@@ -555,6 +830,14 @@ export async function restoreInjectedArcWallet(
       }
     } catch {
       // Try next provider
+    }
+  }
+
+  if (savedLinkedAddress && isValidEvmAddress(savedLinkedAddress)) {
+    try {
+      return await connectLinkedArcAddress(savedLinkedAddress);
+    } catch {
+      return null;
     }
   }
 
@@ -588,6 +871,7 @@ export function disconnectArcWallet(): ArcWalletState {
   activeInjectedProviderName = undefined;
   try {
     localStorage.setItem(WALLET_DISCONNECTED_FLAG_KEY, '1');
+    localStorage.removeItem(WALLET_LINKED_ADDRESS_KEY);
   } catch {
     // Ignore storage error
   }
@@ -645,7 +929,12 @@ export async function submitInjectedOrionRequest(
   if (!provider) {
     throw new Error('Injected wallet provider not available');
   }
-  await ensureArcTestnetChain(provider);
+  const onArc = await ensureArcTestnetChain(provider);
+  if (!onArc) {
+    throw new Error(
+      `Please switch your wallet to Arc Testnet (${ARC_TESTNET_CHAIN_ID}) to submit the wager tx.`,
+    );
+  }
   // Call `roll()` (selector 0xcd596583) on deployed Orion RandomnessDemo v2 (`0x1e4861248142748d37b3778aae40df133e0ad5d2`)
   // which forwards `msg.value` (in 18-decimal native USDC) to `RandomnessHub v2` (`0xe754e552fae5ba55726f0e97a196ee9e19e2f9d2`).
   const valueHex = `0x${relayerRewardGas18.raw.toString(16)}`;

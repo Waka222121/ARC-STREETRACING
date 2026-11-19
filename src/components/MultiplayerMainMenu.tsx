@@ -2,16 +2,20 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActiveRaceEscrow,
   ARC_TESTNET_CHAIN_ID,
+  ARC_TESTNET_FAUCET_URL,
   ArcWalletState,
   buildAddressExplorerUrl,
   buildTxExplorerUrl,
   computeWagerBreakdown,
   DiscoveredWalletProvider,
   fetchOrionHubTelemetry,
+  isRunningInIframe,
+  isValidEvmAddress,
   ORION_HUB_V2_ADDRESS,
   OrionHubTelemetry,
   STAKE_TIERS_USDC,
   StakeTierUsdc,
+  triggerWalletDiscoveryScan,
 } from '../game/arcOrionClient';
 import {
   getPaintSwatchName,
@@ -52,6 +56,9 @@ interface MultiplayerMainMenuProps {
   onConnectInjectedWallet: (
     selected?: DiscoveredWalletProvider,
   ) => Promise<void>;
+  onConnectLinkedAddress: (rawAddress: string) => Promise<void>;
+  onSwitchToArcTestnet: () => Promise<void>;
+  onRefreshWalletBalance: () => Promise<void>;
   onDisconnectWallet: () => void;
   onSwitchToEmbeddedWallet: () => void;
   onFaucetTopUpUsdc: () => void;
@@ -129,6 +136,9 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
   stakeTierUsdc,
   onSelectStakeTier,
   onConnectInjectedWallet,
+  onConnectLinkedAddress,
+  onSwitchToArcTestnet,
+  onRefreshWalletBalance,
   onDisconnectWallet,
   onSwitchToEmbeddedWallet,
   onFaucetTopUpUsdc,
@@ -147,8 +157,14 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [isLocalReady, setIsLocalReady] = useState<boolean>(true);
   const [isWalletModalOpen, setIsWalletModalOpen] = useState<boolean>(false);
+  const [manualAddressInput, setManualAddressInput] = useState<string>('');
+  const [manualAddressError, setManualAddressError] = useState<string | null>(
+    null,
+  );
+  const [isBindingAddress, setIsBindingAddress] = useState<boolean>(false);
   const [orionTelemetry, setOrionTelemetry] =
     useState<OrionHubTelemetry | null>(null);
+  const inIframe = useMemo(() => isRunningInIframe(), []);
 
   // Poll Orion RandomnessHub v2 telemetry from Arc Testnet & drand evmnet
   useEffect(() => {
@@ -240,11 +256,31 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
   };
 
   const handleOpenWalletConnect = () => {
-    if (discoveredWallets.length === 1) {
-      void onConnectInjectedWallet(discoveredWallets[0]);
+    triggerWalletDiscoveryScan();
+    setManualAddressError(null);
+    setIsWalletModalOpen(true);
+  };
+
+  const handleBindManualAddress = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleaned = manualAddressInput.trim();
+    if (!isValidEvmAddress(cleaned)) {
+      setManualAddressError('Enter a valid 0x Arc wallet address (42 chars)');
       return;
     }
-    setIsWalletModalOpen(true);
+    setManualAddressError(null);
+    setIsBindingAddress(true);
+    try {
+      await onConnectLinkedAddress(cleaned);
+      setManualAddressInput('');
+      setIsWalletModalOpen(false);
+    } catch (err) {
+      setManualAddressError(
+        err instanceof Error ? err.message : 'Failed to bind Arc address',
+      );
+    } finally {
+      setIsBindingAddress(false);
+    }
   };
 
   const handleLaunchRace = () => {
@@ -326,9 +362,9 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
       return `Connect Wallet & Stake ${wagerBreakdown.stakePerPlayerUsdc.toString()} USDC —>`;
     }
     if (!hasEnoughUsdcForWager) {
-      return arcWallet.mode === 'injected_eip1193'
-        ? 'Insufficient Arc Testnet USDC'
-        : 'Insufficient Demo USDC (Use +50 USDC)';
+      return arcWallet.mode === 'embedded_arc'
+        ? 'Insufficient Demo USDC (Use +50 USDC)'
+        : 'Insufficient Arc Testnet USDC';
     }
     if (wagerBreakdown.isWagerEnabled) {
       return `Stake ${wagerBreakdown.stakePerPlayerUsdc.toString()} USDC & Race (Pot ${wagerBreakdown.totalPotUsdc.toString()} USDC) —>`;
@@ -433,7 +469,8 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
               </button>
             ) : (
               <>
-                {arcWallet.mode === 'injected_eip1193' &&
+                {(arcWallet.mode === 'injected_eip1193' ||
+                  arcWallet.mode === 'linked_address') &&
                   arcWallet.providerName && (
                     <span className="text-[0.6rem] uppercase text-[rgba(248,248,248,0.65)]">
                       {arcWallet.providerName}
@@ -457,6 +494,19 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                   </a>
                 )}
 
+                {arcWallet.mode === 'injected_eip1193' &&
+                  arcWallet.chainId !== ARC_TESTNET_CHAIN_ID && (
+                    <button
+                      type="button"
+                      data-testid="btn-switch-arc-chain"
+                      onClick={() => void onSwitchToArcTestnet()}
+                      className="cursor-pointer border border-[#f59e0b] bg-[#f59e0b]/20 px-1.5 py-0.5 text-[0.6rem] font-bold uppercase text-[#fbbf24] hover:bg-[#f59e0b] hover:text-black transition"
+                      title={`Switch wallet network to Arc Testnet (${ARC_TESTNET_CHAIN_ID})`}
+                    >
+                      Switch to Arc
+                    </button>
+                  )}
+
                 {arcWallet.mode === 'embedded_arc' ? (
                   <>
                     <button
@@ -473,21 +523,32 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                       data-testid="btn-connect-wallet"
                       onClick={handleOpenWalletConnect}
                       className="cursor-pointer border border-[#2563eb] bg-[#2563eb] px-2 py-0.5 text-[0.6rem] font-bold uppercase text-white hover:bg-[#3b82f6] transition"
-                      title="Connect your own MetaMask / Rabby wallet"
+                      title="Connect your own MetaMask / Rabby wallet or Arc address"
                     >
                       My Wallet
                     </button>
                   </>
                 ) : (
-                  <button
-                    type="button"
-                    data-testid="btn-disconnect-wallet"
-                    onClick={onDisconnectWallet}
-                    className="cursor-pointer border border-[rgba(248,248,248,0.2)] bg-black px-1.5 py-0.5 text-[0.6rem] uppercase text-[#f8f8f8] hover:border-[#f43f5e] hover:text-[#f43f5e] transition"
-                    title="Disconnect wallet"
-                  >
-                    Disconnect
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      data-testid="btn-refresh-balance"
+                      onClick={() => void onRefreshWalletBalance()}
+                      className="cursor-pointer border border-[rgba(248,248,248,0.2)] bg-black px-1.5 py-0.5 text-[0.6rem] uppercase text-[#f8f8f8] hover:border-[#2563eb] transition"
+                      title="Refresh live Arc Testnet USDC balance"
+                    >
+                      ↻
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="btn-disconnect-wallet"
+                      onClick={onDisconnectWallet}
+                      className="cursor-pointer border border-[rgba(248,248,248,0.2)] bg-black px-1.5 py-0.5 text-[0.6rem] uppercase text-[#f8f8f8] hover:border-[#f43f5e] hover:text-[#f43f5e] transition"
+                      title="Disconnect wallet"
+                    >
+                      Disconnect
+                    </button>
+                  </>
                 )}
               </>
             )}
@@ -758,6 +819,20 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
               </div>
             )}
 
+            {wagerBreakdown.isWagerEnabled &&
+              !hasEnoughUsdcForWager &&
+              (arcWallet.mode === 'injected_eip1193' ||
+                arcWallet.mode === 'linked_address') && (
+                <a
+                  href={ARC_TESTNET_FAUCET_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-['Space_Mono',monospace] text-[0.62rem] font-bold text-[#4ade80] underline hover:text-white"
+                >
+                  Get Free Arc Testnet USDC (faucet.circle.com) ↗
+                </a>
+              )}
+
             {/* LAST SETTLED RACE PAYOUT PROOF */}
             {lastSettledEscrow && (
               <div
@@ -984,7 +1059,7 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
         </section>
       </main>
 
-      {/* PERSONAL WALLET PICKER MODAL (EIP-6963 + WINDOW.ETHEREUM + DEMO OPTION) */}
+      {/* PERSONAL WALLET PICKER MODAL (EIP-6963 + MULTI-PROVIDER + DIRECT ARC ADDRESS + DEMO) */}
       {isWalletModalOpen && (
         <div
           data-testid="wallet-picker-modal"
@@ -992,7 +1067,7 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
           onClick={() => setIsWalletModalOpen(false)}
         >
           <div
-            className="w-full max-w-md border border-[rgba(248,248,248,0.18)] bg-[#121216] p-5 text-[#f8f8f8]"
+            className="w-full max-w-md max-h-[90vh] overflow-y-auto border border-[rgba(248,248,248,0.18)] bg-[#121216] p-5 text-[#f8f8f8]"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-3 flex items-center justify-between border-b border-[rgba(248,248,248,0.1)] pb-3">
@@ -1011,6 +1086,21 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                 className="cursor-pointer border border-[rgba(248,248,248,0.18)] bg-black px-2 py-1 font-['Space_Mono',monospace] text-xs text-[#f8f8f8] hover:border-[#2563eb]"
               >
                 ✕
+              </button>
+            </div>
+
+            {/* SECTION 1: BROWSER WALLET EXTENSIONS (EIP-6963 + window.ethereum) */}
+            <div className="mb-3 flex items-center justify-between">
+              <span className="font-['Space_Mono',monospace] text-[0.6rem] font-bold uppercase text-[#3b82f6]">
+                1. Browser Wallets (MetaMask / Rabby / OKX)
+              </span>
+              <button
+                type="button"
+                data-testid="btn-rescan-wallets"
+                onClick={() => triggerWalletDiscoveryScan()}
+                className="cursor-pointer font-['Space_Mono',monospace] text-[0.58rem] uppercase text-[rgba(248,248,248,0.55)] underline hover:text-white"
+              >
+                Rescan
               </button>
             </div>
 
@@ -1044,35 +1134,111 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                 ))}
               </div>
             ) : (
-              <div className="border border-[rgba(248,248,248,0.12)] bg-black/60 p-3.5 font-['Space_Mono',monospace] text-xs leading-relaxed text-[rgba(248,248,248,0.72)]">
-                <p>
-                  No EVM browser wallet extension detected in this browser.
-                  Install{' '}
-                  <a
-                    href="https://metamask.io/download/"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-[#3b82f6] underline"
-                  >
-                    MetaMask
-                  </a>{' '}
-                  or{' '}
-                  <a
-                    href="https://rabby.io/"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-[#3b82f6] underline"
-                  >
-                    Rabby
-                  </a>{' '}
-                  to stake with your own Arc Testnet wallet.
-                </p>
+              <div className="border border-[rgba(248,248,248,0.12)] bg-black/60 p-3 font-['Space_Mono',monospace] text-[0.7rem] leading-relaxed text-[rgba(248,248,248,0.75)] flex flex-col gap-2">
+                {inIframe ? (
+                  <>
+                    <p>
+                      Browser wallet extensions (MetaMask / Rabby) are blocked
+                      inside embedded preview iframes. Open in a full browser
+                      tab to connect directly, or bind your Arc address below.
+                    </p>
+                    <a
+                      href={
+                        typeof window !== 'undefined'
+                          ? window.location.href
+                          : '#'
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      data-testid="link-open-full-tab"
+                      className="inline-block w-full bg-[#2563eb] px-3 py-2 text-center text-[0.68rem] font-bold uppercase text-white hover:bg-[#3b82f6] transition"
+                    >
+                      Open in New Tab to Connect MetaMask / Rabby ↗
+                    </a>
+                  </>
+                ) : (
+                  <p>
+                    No EVM browser wallet extension detected. Install{' '}
+                    <a
+                      href="https://metamask.io/download/"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[#3b82f6] underline"
+                    >
+                      MetaMask
+                    </a>{' '}
+                    or{' '}
+                    <a
+                      href="https://rabby.io/"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[#3b82f6] underline"
+                    >
+                      Rabby
+                    </a>
+                    , or bind your personal Arc Testnet address below.
+                  </p>
+                )}
               </div>
             )}
 
+            {/* SECTION 2: DIRECT PERSONAL ARC ADDRESS BINDING (LIVE ARC RPC BALANCE) */}
+            <form
+              onSubmit={(e) => void handleBindManualAddress(e)}
+              className="mt-4 border-t border-[rgba(248,248,248,0.1)] pt-3.5 flex flex-col gap-2"
+            >
+              <label
+                htmlFor="manual-arc-address-input"
+                className="font-['Space_Mono',monospace] text-[0.6rem] font-bold uppercase text-[#3b82f6]"
+              >
+                2. Bind Your Personal Arc Testnet Address (0x...)
+              </label>
+              <div className="flex gap-2">
+                <input
+                  id="manual-arc-address-input"
+                  data-testid="input-manual-arc-address"
+                  type="text"
+                  value={manualAddressInput}
+                  onChange={(e) => {
+                    setManualAddressInput(e.target.value);
+                    if (manualAddressError) setManualAddressError(null);
+                  }}
+                  placeholder="0xYourArcWalletAddress..."
+                  spellCheck={false}
+                  autoComplete="off"
+                  className="w-full border border-[rgba(248,248,248,0.18)] bg-black px-2.5 py-2 font-['Space_Mono',monospace] text-xs text-white focus:border-[#2563eb] focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  data-testid="btn-bind-manual-address"
+                  disabled={isBindingAddress}
+                  className="shrink-0 cursor-pointer border border-[#2563eb] bg-[#2563eb] px-3 py-2 font-['Space_Mono',monospace] text-xs font-bold uppercase text-white hover:bg-[#3b82f6] disabled:opacity-50 transition"
+                >
+                  {isBindingAddress ? '...' : 'Bind'}
+                </button>
+              </div>
+              {manualAddressError && (
+                <div className="font-['Space_Mono',monospace] text-[0.64rem] text-[#f43f5e]">
+                  {manualAddressError}
+                </div>
+              )}
+              <div className="flex items-center justify-between font-['Space_Mono',monospace] text-[0.6rem] text-[rgba(248,248,248,0.5)]">
+                <span>Reads live balance from rpc.testnet.arc.io</span>
+                <a
+                  href={ARC_TESTNET_FAUCET_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[#4ade80] underline hover:text-white"
+                >
+                  Arc Faucet ↗
+                </a>
+              </div>
+            </form>
+
+            {/* SECTION 3: QUICK PRACTICE OPTIONS */}
             <div className="mt-4 border-t border-[rgba(248,248,248,0.1)] pt-3.5 flex flex-col gap-2">
               <span className="font-['Space_Mono',monospace] text-[0.6rem] uppercase opacity-50">
-                No wallet installed yet?
+                Or play without a wallet
               </span>
               <div className="grid grid-cols-2 gap-2">
                 <button
