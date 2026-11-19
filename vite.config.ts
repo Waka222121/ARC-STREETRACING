@@ -14,6 +14,18 @@ export default defineConfig(() => {
         '@': path.resolve(rootDir, '.'),
       },
     },
+    build: {
+      chunkSizeWarningLimit: 900,
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (id.includes('node_modules/three')) {
+              return 'three';
+            }
+          },
+        },
+      },
+    },
     server: {
       port: 3000,
       host: '0.0.0.0',

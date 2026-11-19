@@ -9,5 +9,6 @@ dist
 *.md
 contracts
 docs
-deploy-cloud-run.sh
+deploy-fly.sh
+fly.toml
 vercel.json

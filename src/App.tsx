@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { MultiplayerMainMenu } from './components/MultiplayerMainMenu';
+import {
+  LobbyStartMeta,
+  MultiplayerMainMenu,
+} from './components/MultiplayerMainMenu';
 import {
   appendRecentRaceSession,
   loadRecentRacesFromStorage,
@@ -10,14 +13,20 @@ import {
   ActiveRaceEscrow,
   ARC_TESTNET_CHAIN_ID,
   ArcWalletState,
+  calculateTargetRoundForRequest,
+  computeWagerBreakdown,
   connectInjectedArcWallet,
+  deriveWinnerLaneFromRandomness,
   loadEmbeddedArcWallet,
+  resolveOrionBeaconRandomness,
   saveEmbeddedArcBalance,
   StakeTierUsdc,
+  submitInjectedOrionRequest,
 } from './game/arcOrionClient';
 import { soundEngine } from './game/audio';
-import { DEFAULT_CAR_CONFIG } from './game/tuning';
+import { resolveUniqueLanePaintColors } from './game/physics';
 import { TRACK_CATALOG } from './game/track';
+import { DEFAULT_CAR_CONFIG } from './game/tuning';
 import {
   CameraPreset,
   CarConfig,
@@ -28,14 +37,7 @@ import {
   RivalDifficulty,
   TrackId,
 } from './game/types';
-import { useOnlineMultiplayer } from './game/useOnlineMultiplayer';
 import { LiveHudSnapshot, WorldCanvas } from './game/WorldCanvas';
-import {
-  AuthoritativeWalletSnapshot,
-  MatchFinishedPayload,
-  MatchStartPayload,
-  SerializedRacerState,
-} from './shared/multiplayerProtocol';
 
 const INITIAL_HUD: LiveHudSnapshot = {
   speedKmh: 0,
@@ -50,16 +52,18 @@ const INITIAL_HUD: LiveHudSnapshot = {
   totalDriftScore: 0,
   driftMultiplier: 1,
   position: 1,
-  totalRacers: 2,
+  totalRacers: 4,
   lap: 1,
   totalLaps: 3,
   elapsedSec: 0,
   cameraMode: 'top_down',
-  aliveRacers: 2,
+  aliveRacers: 4,
   trafficNearMisses: 0,
   racerPositions: [],
   trafficPositions: [],
 };
+
+const FAUCET_MINT_USDC6 = 50_000_000n; // +50.00 USDC (6 decimals)
 
 export default function App() {
   const [gameState, setGameState] = useState<GameState>(() => {
@@ -96,12 +100,12 @@ export default function App() {
 
   const [lobbySlotOccupancy, setLobbySlotOccupancy] = useState<
     [boolean, boolean, boolean, boolean]
-  >([false, true, false, false]);
+  >([true, true, true, true]);
   const [lobbySlotColors, setLobbySlotColors] = useState<
     [string, string, string, string]
-  >(['#2563eb', '#fbb124', '#06b6d4', '#f43f5e']);
+  >(() => resolveUniqueLanePaintColors(DEFAULT_CAR_CONFIG.paintColor));
 
-  // Arc Testnet Wallet + Authoritative Server Escrow states
+  // Arc Testnet Wallet + Orion RandomnessHub v2 Escrow states
   const [arcWallet, setArcWallet] = useState<ArcWalletState>(() =>
     loadEmbeddedArcWallet(),
   );
@@ -109,13 +113,10 @@ export default function App() {
   const [walletStatusMessage, setWalletStatusMessage] = useState<string | null>(
     null,
   );
+  const [isLockingEscrow, setIsLockingEscrow] = useState<boolean>(false);
   const [lastSettledEscrow, setLastSettledEscrow] =
     useState<ActiveRaceEscrow | null>(null);
-
-  const [activeOnlineMatch, setActiveOnlineMatch] =
-    useState<MatchStartPayload | null>(null);
-  const onlineRacersSnapshotRef = useRef<SerializedRacerState[] | null>(null);
-  const onlinePlayerIdRef = useRef<string | null>(null);
+  const activeEscrowRef = useRef<ActiveRaceEscrow | null>(null);
 
   const [trackId] = useState<TrackId>('olympic_circuit');
   const [rivalDifficulty] = useState<RivalDifficulty>('pro');
@@ -126,7 +127,7 @@ export default function App() {
   const [, setHudSnapshot] = useState<LiveHudSnapshot>(INITIAL_HUD);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [raceSummary, setRaceSummary] = useState<RaceSummary | null>(null);
-  const [lastWinningsUsdc, setLastWinningsUsdc] = useState<string>('10.00');
+  const [lastWinningsUsdc, setLastWinningsUsdc] = useState<string>('20.00');
   const [recentRaces, setRecentRaces] = useState<RecentRaceSession[]>(() =>
     loadRecentRacesFromStorage(),
   );
@@ -165,150 +166,6 @@ export default function App() {
     }
   }, [recentRaces]);
 
-  const handleWalletSync = useCallback(
-    (wallet: AuthoritativeWalletSnapshot, notice?: string) => {
-      const rawUsdc6 = BigInt(wallet.balanceUsdc6);
-      const rawGas18 = BigInt(wallet.balanceNativeGas18);
-      setArcWallet((prev) => {
-        if (prev.mode === 'embedded_arc') {
-          saveEmbeddedArcBalance(rawUsdc6);
-        }
-        return {
-          ...prev,
-          balanceUsdc: wallet.balanceFormatted,
-          balanceRawUsdc6: rawUsdc6,
-          balanceRawGas18: rawGas18,
-        };
-      });
-      if (notice) {
-        setWalletStatusMessage(notice);
-      }
-    },
-    [],
-  );
-
-  const handleOnlineMatchStart = useCallback((payload: MatchStartPayload) => {
-    setActiveOnlineMatch(payload);
-    onlineRacersSnapshotRef.current = payload.activeRacers;
-    setRaceSummary(null);
-    setLastWinningsUsdc(payload.potFormatted);
-    document.body.dataset.state = 'playing';
-    setRaceSessionId((prev) => prev + 1);
-    setGameState('playing');
-  }, []);
-
-  const handleOnlineMatchFinished = useCallback(
-    (payload: MatchFinishedPayload) => {
-      const localId = onlinePlayerIdRef.current;
-      const localRanking =
-        payload.rankings.find((r) => r.playerId === localId) ??
-        payload.rankings[0];
-      const placement = localRanking?.placement ?? payload.rankings.length;
-      const isVictory =
-        localId !== null
-          ? payload.winnerPlayerId === localId
-          : placement === 1;
-      const totalRacers = payload.rankings.length;
-      const aliveCount = payload.rankings.filter((r) => !r.eliminated).length;
-      const survivalSec = (localRanking?.survivalTimeMs ?? 0) / 1000;
-      const trackSpec = TRACK_CATALOG[trackId];
-
-      const summary: RaceSummary = {
-        placement,
-        totalRacers,
-        finishTimeSec: survivalSec,
-        bestLapSec: survivalSec,
-        topSpeedReachedKmh: 220,
-        totalDriftScore: 0,
-        cashEarned: isVictory ? Math.round(Number(payload.payoutFormatted) * 100) : 0,
-        reputationEarned: isVictory ? 150 : 40,
-        trackName: trackSpec.name,
-        isVictory,
-        eliminatedByTraffic: Boolean(localRanking?.eliminated),
-        aliveCount,
-        trafficNearMisses: 0,
-      };
-
-      const lockedNames: [string, string, string, string] = [
-        payload.rankings.find((r) => r.laneIndex === 0)?.displayName ?? 'Open',
-        payload.rankings.find((r) => r.laneIndex === 1)?.displayName ?? 'Open',
-        payload.rankings.find((r) => r.laneIndex === 2)?.displayName ?? 'Open',
-        payload.rankings.find((r) => r.laneIndex === 3)?.displayName ?? 'Open',
-      ];
-      const lockedAddrs: [string, string, string, string] = [
-        payload.rankings.find((r) => r.laneIndex === 0)?.walletAddress ?? '',
-        payload.rankings.find((r) => r.laneIndex === 1)?.walletAddress ?? '',
-        payload.rankings.find((r) => r.laneIndex === 2)?.walletAddress ?? '',
-        payload.rankings.find((r) => r.laneIndex === 3)?.walletAddress ?? '',
-      ];
-
-      setLastSettledEscrow({
-        raceId: Date.now() % 100000,
-        requestId: String(payload.orionRound),
-        targetDrandRound: payload.orionRound,
-        stakePerPlayerUsdc: stakeTierUsdc,
-        totalPotUsdc: payload.payoutFormatted,
-        relayerRewardUsdc: '0.01',
-        lockedRacers: lockedNames,
-        lockedAddresses: lockedAddrs,
-        txHash: payload.settlementTxHash,
-        lockedAtMs: Date.now(),
-        status: 'settled',
-        randomnessHex: payload.orionRandomnessHash,
-        winnerLane: payload.winnerLaneIndex,
-        winnerCallsign: payload.winnerDisplayName,
-        winnerAddress: payload.winnerWalletAddress,
-        playerWon: isVictory,
-      });
-
-      setLastWinningsUsdc(payload.payoutFormatted);
-      setRaceSummary(summary);
-      setRecentRaces((prev) =>
-        appendRecentRaceSession(prev, {
-          id: `session-${Date.now()}`,
-          trackId,
-          trackName: trackSpec.name,
-          placement,
-          totalRacers,
-          earningsUsdc: isVictory ? payload.payoutFormatted : '0.00',
-          cashEarned: summary.cashEarned,
-          isVictory,
-          finishedAtMs: Date.now(),
-        }),
-      );
-
-      soundEngine.stopDrivingLoop();
-      soundEngine.playRaceFanfare(isVictory);
-      document.body.dataset.state = 'gameover';
-      setGameState('gameover');
-    },
-    [stakeTierUsdc, trackId],
-  );
-
-  const online = useOnlineMultiplayer({
-    walletAddress: arcWallet.address,
-    displayName: playerNickname,
-    preferredColor: carConfig.paintColor,
-    onWalletSync: handleWalletSync,
-    onMatchStart: handleOnlineMatchStart,
-    onMatchTick: (tick) => {
-      onlineRacersSnapshotRef.current = tick.racers;
-    },
-    onMatchEliminated: (ev) => {
-      const current = onlineRacersSnapshotRef.current;
-      if (current) {
-        onlineRacersSnapshotRef.current = current.map((r) =>
-          r.playerId === ev.playerId ? { ...r, eliminated: true } : r,
-        );
-      }
-    },
-    onMatchFinished: handleOnlineMatchFinished,
-  });
-
-  useEffect(() => {
-    onlinePlayerIdRef.current = online.playerId;
-  }, [online.playerId]);
-
   const handleConnectInjectedWallet = useCallback(async () => {
     try {
       setWalletStatusMessage(
@@ -332,12 +189,177 @@ export default function App() {
   }, []);
 
   const handleFaucetTopUpUsdc = useCallback(() => {
-    online.requestFaucet();
-  }, [online.requestFaucet]);
+    setArcWallet((prev) => {
+      if (prev.mode !== 'embedded_arc') return prev;
+      return saveEmbeddedArcBalance(prev.balanceRawUsdc6 + FAUCET_MINT_USDC6);
+    });
+    setWalletStatusMessage('+50.00 Testnet USDC minted to embedded wallet');
+  }, []);
+
+  const handleStartRace = useCallback(
+    async (meta?: LobbyStartMeta) => {
+      if (isLockingEscrow) return;
+      const breakdown = computeWagerBreakdown(stakeTierUsdc);
+
+      const colors =
+        meta?.slotColors ?? resolveUniqueLanePaintColors(carConfig.paintColor);
+      const callsigns: [string, string, string, string] = meta?.slotCallsigns ?? [
+        'Vortex_02',
+        playerNickname.trim() || 'RACER_01',
+        'Kenshin_01',
+        'Apex_03',
+      ];
+      const addresses: [string, string, string, string] = meta?.slotAddresses ?? [
+        '0x9a2F4401B7C1120E38c5D8496c1aB02E8F41C202',
+        arcWallet.address,
+        '0x4eB80219cA7410F93e20A8814d6E319B12D0A103',
+        '0xD31c7840E290F4b16A55C2398E71024a91B7F404',
+      ];
+
+      setLobbySlotColors(colors);
+      setLobbySlotOccupancy([true, true, true, true]);
+
+      if (breakdown.isWagerEnabled) {
+        if (arcWallet.balanceRawUsdc6 < breakdown.playerTotalLockUsdc.raw) {
+          setWalletStatusMessage(
+            'Insufficient USDC balance — click +50 USDC to top up.',
+          );
+          return;
+        }
+
+        setIsLockingEscrow(true);
+        let txHash: string | null = null;
+        try {
+          if (arcWallet.mode === 'injected_eip1193') {
+            setWalletStatusMessage(
+              'Confirm Orion RandomnessHub v2 wager tx in wallet...',
+            );
+            txHash = await submitInjectedOrionRequest(
+              arcWallet.address,
+              breakdown.relayerRewardGas18,
+            );
+          } else {
+            const updatedWallet = saveEmbeddedArcBalance(
+              arcWallet.balanceRawUsdc6 - breakdown.playerTotalLockUsdc.raw,
+            );
+            setArcWallet(updatedWallet);
+          }
+
+          const nowSec = BigInt(Math.floor(Date.now() / 1000));
+          const targetRound = Number(calculateTargetRoundForRequest(nowSec));
+          const raceId = Math.floor(10000 + Math.random() * 90000);
+
+          activeEscrowRef.current = {
+            raceId,
+            requestId: String(raceId),
+            targetDrandRound: targetRound,
+            stakePerPlayerUsdc: breakdown.stakePerPlayerUsdc.toFixed(2),
+            totalPotUsdc: breakdown.totalPotUsdc.toFixed(2),
+            relayerRewardUsdc: breakdown.relayerRewardUsdc.toFixed(2),
+            lockedRacers: callsigns,
+            lockedAddresses: addresses,
+            txHash,
+            lockedAtMs: Date.now(),
+            status: 'locked',
+          };
+          setLastWinningsUsdc(breakdown.totalPotUsdc.toFixed(2));
+          setWalletStatusMessage(null);
+        } catch (err) {
+          const msg =
+            err instanceof Error
+              ? err.message
+              : 'Escrow lock transaction cancelled';
+          setWalletStatusMessage(msg);
+          setIsLockingEscrow(false);
+          return;
+        } finally {
+          setIsLockingEscrow(false);
+        }
+      } else {
+        activeEscrowRef.current = null;
+        setLastWinningsUsdc('0.00');
+      }
+
+      setRaceSummary(null);
+      document.body.dataset.state = 'playing';
+      setRaceSessionId((prev) => prev + 1);
+      setGameState('playing');
+    },
+    [arcWallet, carConfig.paintColor, isLockingEscrow, playerNickname, stakeTierUsdc],
+  );
+
+  const handleRaceFinish = useCallback(
+    (summary: RaceSummary) => {
+      const isVictory = summary.isVictory || summary.placement === 1;
+      const trackSpec = TRACK_CATALOG[trackId];
+      const lockedEscrow = activeEscrowRef.current;
+      activeEscrowRef.current = null;
+
+      const potStr = lockedEscrow?.totalPotUsdc ?? '0.00';
+      setLastWinningsUsdc(potStr);
+      setRaceSummary(summary);
+
+      setRecentRaces((prev) =>
+        appendRecentRaceSession(prev, {
+          id: `session-${Date.now()}`,
+          trackId,
+          trackName: trackSpec.name,
+          placement: summary.placement,
+          totalRacers: summary.totalRacers,
+          earningsUsdc: isVictory ? potStr : '0.00',
+          cashEarned: summary.cashEarned,
+          isVictory,
+          finishedAtMs: Date.now(),
+        }),
+      );
+
+      if (lockedEscrow) {
+        const potRaw6 = computeWagerBreakdown(
+          lockedEscrow.stakePerPlayerUsdc,
+        ).totalPotUsdc.raw;
+
+        if (isVictory) {
+          setArcWallet((prev) => {
+            if (prev.mode !== 'embedded_arc') return prev;
+            return saveEmbeddedArcBalance(prev.balanceRawUsdc6 + potRaw6);
+          });
+        }
+
+        void resolveOrionBeaconRandomness(
+          lockedEscrow.targetDrandRound,
+          lockedEscrow.requestId,
+        ).then(({ drandSignatureHex, randomnessHex }) => {
+          const beaconLane = deriveWinnerLaneFromRandomness(randomnessHex);
+          const aiLanes: readonly (0 | 2 | 3)[] = [0, 2, 3];
+          const winnerLane: 0 | 1 | 2 | 3 = isVictory
+            ? 1
+            : beaconLane === 1
+              ? aiLanes[0]
+              : beaconLane;
+
+          setLastSettledEscrow({
+            ...lockedEscrow,
+            status: 'settled',
+            drandSignatureHex,
+            randomnessHex,
+            winnerLane,
+            winnerCallsign: lockedEscrow.lockedRacers[winnerLane],
+            winnerAddress: lockedEscrow.lockedAddresses[winnerLane],
+            playerWon: isVictory,
+          });
+        });
+      }
+
+      soundEngine.stopDrivingLoop();
+      soundEngine.playRaceFanfare(isVictory);
+      document.body.dataset.state = 'gameover';
+      setGameState('gameover');
+    },
+    [trackId],
+  );
 
   const handleReturnToLobby = useCallback(() => {
-    setActiveOnlineMatch(null);
-    onlineRacersSnapshotRef.current = null;
+    activeEscrowRef.current = null;
     setRaceSummary(null);
     document.body.dataset.state = 'title';
     setGameState('title');
@@ -377,7 +399,7 @@ export default function App() {
   }, [handleToggleMute]);
 
   return (
-    <main className="relative w-full h-full overflow-hidden bg-[#56cc5c] select-none">
+    <main className="relative w-full h-full overflow-hidden bg-[#56cc5c] select-none touch-manipulation">
       <WorldCanvas
         gameState={gameState}
         carConfig={carConfig}
@@ -388,18 +410,13 @@ export default function App() {
         raceSessionId={raceSessionId}
         lobbySlotOccupancy={lobbySlotOccupancy}
         lobbySlotColors={lobbySlotColors}
-        onlineMatch={activeOnlineMatch}
-        onlineRacersSnapshotRef={onlineRacersSnapshotRef}
-        localOnlinePlayerId={online.playerId}
-        onSendOnlineLaneHop={online.sendLaneHop}
+        onlineMatch={null}
         onHudUpdate={setHudSnapshot}
-        onRaceFinish={setRaceSummary}
+        onRaceFinish={handleRaceFinish}
         onTogglePause={handleReturnToLobby}
         onCycleRaceCamera={handleCycleRaceCamera}
         onStartFromKey={() => {
-          if (!online.roomState) {
-            online.quickMatch(stakeTierUsdc);
-          }
+          void handleStartRace();
         }}
       />
 
@@ -409,7 +426,7 @@ export default function App() {
           onUpdateCarConfig={setCarConfig}
           playerNickname={playerNickname}
           onChangePlayerNickname={setPlayerNickname}
-          online={online}
+          onStartRace={handleStartRace}
           onSlotOccupancyChange={setLobbySlotOccupancy}
           onSlotColorsChange={setLobbySlotColors}
           arcWallet={arcWallet}
@@ -418,6 +435,7 @@ export default function App() {
           onConnectInjectedWallet={handleConnectInjectedWallet}
           onSwitchToEmbeddedWallet={handleSwitchToEmbeddedWallet}
           onFaucetTopUpUsdc={handleFaucetTopUpUsdc}
+          isLockingEscrow={isLockingEscrow}
           lastSettledEscrow={lastSettledEscrow}
           walletStatusMessage={walletStatusMessage}
           recentRaces={recentRaces}

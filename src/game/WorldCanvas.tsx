@@ -1635,9 +1635,23 @@ export const WorldCanvas: React.FC<WorldCanvasProps> = ({
     };
 
     const onPointerDown = (e: PointerEvent) => {
-      if (gameStateRef.current === 'title' && e.target === renderer.domElement) {
+      if (e.target !== renderer.domElement) return;
+      if (gameStateRef.current === 'title') {
         isDraggingOrbitRef.current = true;
         lastDragClientRef.current = { x: e.clientX, y: e.clientY };
+      } else if (gameStateRef.current === 'playing') {
+        const rect = renderer.domElement.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        const isLeftHalf = e.clientX < rect.left + rect.width * 0.5;
+        const prevLane = playerTargetLaneIdxRef.current;
+        const nextLane = isLeftHalf
+          ? Math.max(0, prevLane - 1)
+          : Math.min(HIGHWAY_WORLD_LANE_X.length - 1, prevLane + 1);
+        playerTargetLaneIdxRef.current = nextLane;
+        steerHoldTimeRef.current = 0;
+        if (onlineMatchRef.current && nextLane !== prevLane) {
+          onSendOnlineLaneHopRef.current?.(nextLane as 0 | 1 | 2 | 3);
+        }
       }
     };
 

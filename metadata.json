@@ -1,6 +1,6 @@
 {
   "name": "ARC STREETRACING",
-  "description": "Online 2–4 player highway survival street racing with deterministic traffic and Arc Testnet USDC wagering.",
+  "description": "4-player highway survival street racing against AI rivals with deterministic traffic and Arc Testnet USDC wagering.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -13,10 +13,11 @@ import {
 } from './src/shared/multiplayerProtocol';
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
+const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 3000);
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-// Optional comma-separated allowed origins for Vercel + Cloud Run hybrid deployments
+// Optional comma-separated allowed origins for Fly.io + Vercel hybrid deployments
 // Examples: "https://my-game.vercel.app,https://*.vercel.app" or "*" (default)
 const RAW_CORS_ORIGINS = (process.env.CORS_ORIGINS || '*').trim();
 const ALLOWED_ORIGIN_PATTERNS = RAW_CORS_ORIGINS.split(',')
@@ -45,7 +46,7 @@ async function startServer() {
   app.set('trust proxy', 1);
   app.use(express.json());
 
-  // CORS headers for cross-origin Vercel frontend -> Cloud Run /api/* requests
+  // CORS headers for cross-origin frontend (e.g. Vercel) -> Fly.io /api/* requests
   app.use('/api', (req, res, next) => {
     const origin = req.headers.origin;
     if (origin && isOriginAllowed(origin)) {
@@ -73,6 +74,7 @@ async function startServer() {
     res.json({
       ok: true,
       mode: IS_PRODUCTION ? 'production' : 'development',
+      region: process.env.FLY_REGION || null,
       chainId: ARC_TESTNET_CHAIN_ID,
       orionHubV2: ORION_HUB_V2_ADDRESS,
       ...stats,
@@ -181,7 +183,7 @@ async function startServer() {
     });
   });
 
-  // Cloud Run / Load Balancer WebSocket keepalive heartbeat (25s)
+  // Fly.io / Proxy WebSocket keepalive heartbeat (25s)
   const heartbeatInterval = setInterval(() => {
     for (const client of wss.clients) {
       if (aliveSockets.get(client) === false) {
@@ -272,9 +274,9 @@ async function startServer() {
     clearInterval(heartbeatInterval);
   });
 
-  server.listen(PORT, '0.0.0.0', () => {
+  server.listen(PORT, HOST, () => {
     console.log(
-      `[ARC STREETRACING] Authoritative server listening on http://0.0.0.0:${PORT} (WebSocket /ws, mode=${IS_PRODUCTION ? 'production' : 'development'})`,
+      `[ARC STREETRACING] Authoritative server listening on http://${HOST}:${PORT} (WebSocket /ws, mode=${IS_PRODUCTION ? 'production' : 'development'})`,
     );
   });
 }

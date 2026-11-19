@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActiveRaceEscrow,
   ARC_TESTNET_CHAIN_ID,
@@ -20,11 +20,6 @@ import {
 } from '../game/physics';
 import { CHASSIS_CATALOG } from '../game/tuning';
 import { CarConfig, RecentRaceSession } from '../game/types';
-import { OnlineMultiplayerApi } from '../game/useOnlineMultiplayer';
-import {
-  OnlineSlotStatus,
-  SerializedLobbySlot,
-} from '../shared/multiplayerProtocol';
 import {
   DEFAULT_RECENT_RACES,
   RecentRacesDashboard,
@@ -32,12 +27,19 @@ import {
 
 export type MultiplayerModeTab = 'quick_match' | 'create_room' | 'join_room';
 
+export interface LobbyStartMeta {
+  roomCode: string;
+  slotCallsigns: [string, string, string, string];
+  slotAddresses: [string, string, string, string];
+  slotColors: [string, string, string, string];
+}
+
 interface MultiplayerMainMenuProps {
   carConfig: CarConfig;
   onUpdateCarConfig: (updater: (prev: CarConfig) => CarConfig) => void;
   playerNickname: string;
   onChangePlayerNickname: (name: string) => void;
-  online: OnlineMultiplayerApi;
+  onStartRace: (meta: LobbyStartMeta) => Promise<void> | void;
   onSlotOccupancyChange?: (
     occupiedByLane: [boolean, boolean, boolean, boolean],
   ) => void;
@@ -48,6 +50,7 @@ interface MultiplayerMainMenuProps {
   onConnectInjectedWallet: () => Promise<void>;
   onSwitchToEmbeddedWallet: () => void;
   onFaucetTopUpUsdc: () => void;
+  isLockingEscrow?: boolean;
   lastSettledEscrow: ActiveRaceEscrow | null;
   walletStatusMessage: string | null;
   recentRaces?: RecentRaceSession[];
@@ -58,22 +61,46 @@ interface MultiplayerMainMenuProps {
 const UNIFIED_CAR_MODEL_NAME = CHASSIS_CATALOG.rx7.name;
 const PAINT_SWATCHES = LOBBY_PAINT_SWATCHES;
 const DISPLAY_LANE_ORDER: readonly (0 | 1 | 2 | 3)[] = [1, 0, 2, 3];
+
 const LANE_LABELS: Record<0 | 1 | 2 | 3, string> = {
   0: 'Lane 1 • Left',
   1: 'Lane 2 • Mid-Left',
   2: 'Lane 3 • Mid-Right',
   3: 'Lane 4 • Right',
 };
-const DEFAULT_SLOT_CODES: Record<0 | 1 | 2 | 3, 'P1' | 'P2' | 'P3' | 'P4'> = {
-  1: 'P1',
-  0: 'P2',
-  2: 'P3',
-  3: 'P4',
+
+const AI_RIVAL_SLOTS: Record<
+  0 | 2 | 3,
+  { slotCode: 'P2' | 'P3' | 'P4'; callsign: string; address: string; pingMs: number }
+> = {
+  0: {
+    slotCode: 'P2',
+    callsign: 'Vortex_02',
+    address: '0x9a2F4401B7C1120E38c5D8496c1aB02E8F41C202',
+    pingMs: 18,
+  },
+  2: {
+    slotCode: 'P3',
+    callsign: 'Kenshin_01',
+    address: '0x4eB80219cA7410F93e20A8814d6E319B12D0A103',
+    pingMs: 24,
+  },
+  3: {
+    slotCode: 'P4',
+    callsign: 'Apex_03',
+    address: '0xD31c7840E290F4b16A55C2398E71024a91B7F404',
+    pingMs: 31,
+  },
 };
 
 function shortenAddress(addr: string): string {
   if (!addr || addr.length < 12) return addr;
   return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+}
+
+function generateRoomCode(): string {
+  const num = Math.floor(100 + Math.random() * 900);
+  return `HWY-${num}`;
 }
 
 function normalizeRoomCode(raw: string): string {
@@ -89,7 +116,7 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
   onUpdateCarConfig,
   playerNickname,
   onChangePlayerNickname,
-  online,
+  onStartRace,
   onSlotOccupancyChange,
   onSlotColorsChange,
   arcWallet,
@@ -98,6 +125,7 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
   onConnectInjectedWallet,
   onSwitchToEmbeddedWallet,
   onFaucetTopUpUsdc,
+  isLockingEscrow = false,
   lastSettledEscrow,
   walletStatusMessage,
   recentRaces,
@@ -105,26 +133,14 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
   onToggleMute,
 }) => {
   const [activeTab, setActiveTab] = useState<MultiplayerModeTab>('quick_match');
+  const [roomCode, setRoomCode] = useState<string>(() => generateRoomCode());
   const [joinCodeInput, setJoinCodeInput] = useState<string>('');
+  const [joinedRoomCode, setJoinedRoomCode] = useState<string | null>(null);
   const [joinInputError, setJoinInputError] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
-  const [nowMs, setNowMs] = useState<number>(() => Date.now());
-
-  // Orion RandomnessHub v2 live telemetry on Arc Testnet
+  const [isLocalReady, setIsLocalReady] = useState<boolean>(true);
   const [orionTelemetry, setOrionTelemetry] =
     useState<OrionHubTelemetry | null>(null);
-
-  const roomState = online.roomState;
-
-  // Live 250ms clock for countdowns & 60s pre-race lobby escrow timeout
-  useEffect(() => {
-    if (!roomState || (roomState.escrowExpiresAt === null && roomState.status !== 'countdown')) {
-      return;
-    }
-    setNowMs(Date.now());
-    const timer = window.setInterval(() => setNowMs(Date.now()), 250);
-    return () => window.clearInterval(timer);
-  }, [roomState?.escrowExpiresAt, roomState?.status]);
 
   // Poll Orion RandomnessHub v2 telemetry from Arc Testnet & drand evmnet
   useEffect(() => {
@@ -143,139 +159,39 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
     };
   }, []);
 
-  // Sync local stake input when server room changes stake tier
-  useEffect(() => {
-    if (roomState && roomState.stakeTierUsdc !== stakeTierUsdc) {
-      onSelectStakeTier(roomState.stakeTierUsdc as StakeTierUsdc);
-    }
-  }, [roomState?.stakeTierUsdc]);
+  // Resolve 4 unique paint colors across P1..P4 (P1 = Lane 1, P2 = Lane 0, P3 = Lane 2, P4 = Lane 3)
+  const laneColors = useMemo<[string, string, string, string]>(() => {
+    return resolveUniqueLanePaintColors(carConfig.paintColor);
+  }, [carConfig.paintColor]);
 
-  const activeStakeStr = roomState ? roomState.stakeTierUsdc : stakeTierUsdc;
-  const wagerBreakdown = computeWagerBreakdown(activeStakeStr as StakeTierUsdc);
+  // Keep 3D preview synchronized with all 4 occupied cars & unique colors
+  useEffect(() => {
+    onSlotOccupancyChange?.([true, true, true, true]);
+  }, [onSlotOccupancyChange]);
+
+  useEffect(() => {
+    onSlotColorsChange?.(laneColors);
+  }, [laneColors, onSlotColorsChange]);
+
+  const wagerBreakdown = computeWagerBreakdown(stakeTierUsdc);
   const hasEnoughUsdcForWager =
     !wagerBreakdown.isWagerEnabled ||
     arcWallet.balanceRawUsdc6 >= wagerBreakdown.playerTotalLockUsdc.raw;
 
-  const localSlot: SerializedLobbySlot | null =
-    roomState && online.playerId
-      ? roomState.slots.find((s) => s.playerId === online.playerId) ?? null
-      : null;
+  const activeRoomDisplayCode =
+    activeTab === 'join_room' && joinedRoomCode ? joinedRoomCode : roomCode;
 
-  // Sync server-assigned unique paint color back into local carConfig
-  useEffect(() => {
-    if (!localSlot) return;
-    const serverHex = normalizePaintHex(localSlot.paintColor);
-    if (normalizePaintHex(carConfig.paintColor) !== serverHex) {
-      onUpdateCarConfig((prev) => ({ ...prev, paintColor: serverHex }));
-    }
-  }, [localSlot?.paintColor]);
-
-  // Sync 3D starting grid occupancy (live human players ONLY — zero AI cars)
-  const fallbackLaneColors = resolveUniqueLanePaintColors(carConfig.paintColor);
-  const laneOccupancy: [boolean, boolean, boolean, boolean] = roomState
-    ? [
-        roomState.slots[0].status !== 'waiting',
-        roomState.slots[1].status !== 'waiting',
-        roomState.slots[2].status !== 'waiting',
-        roomState.slots[3].status !== 'waiting',
-      ]
-    : [false, true, false, false];
-
-  const laneColors: [string, string, string, string] = roomState
-    ? [
-        roomState.slots[0].paintColor,
-        roomState.slots[1].paintColor,
-        roomState.slots[2].paintColor,
-        roomState.slots[3].paintColor,
-      ]
-    : [
-        fallbackLaneColors[0],
-        fallbackLaneColors[1],
-        fallbackLaneColors[2],
-        fallbackLaneColors[3],
-      ];
-
-  useEffect(() => {
-    onSlotOccupancyChange?.(laneOccupancy);
-  }, [
-    laneOccupancy[0],
-    laneOccupancy[1],
-    laneOccupancy[2],
-    laneOccupancy[3],
-    onSlotOccupancyChange,
-  ]);
-
-  useEffect(() => {
-    onSlotColorsChange?.(laneColors);
-  }, [
-    laneColors[0],
-    laneColors[1],
-    laneColors[2],
-    laneColors[3],
-    onSlotColorsChange,
-  ]);
-
-  const handleSelectTab = (tab: MultiplayerModeTab) => {
-    setJoinInputError(null);
-    online.clearError();
-    setActiveTab(tab);
-
-    if (tab === 'create_room' && !roomState && online.connectionStatus === 'connected') {
-      online.createRoom(stakeTierUsdc);
-    }
-  };
-
-  const handleCopyRoomCode = async () => {
-    if (!roomState) return;
-    try {
-      await navigator.clipboard.writeText(roomState.roomCode);
-      setCopiedCode(true);
-      window.setTimeout(() => setCopiedCode(false), 1800);
-    } catch {
-      setCopiedCode(true);
-      window.setTimeout(() => setCopiedCode(false), 1800);
-    }
-  };
-
-  const handleJoinByCodeSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const formatted = normalizeRoomCode(joinCodeInput);
-    if (formatted.length < 4) {
-      setJoinInputError('Enter a valid 6-character room code (e.g. HWY-742)');
-      return;
-    }
-    setJoinInputError(null);
-    online.joinRoom(formatted);
-  };
-
-  const handleStakeTierChange = (tier: StakeTierUsdc) => {
-    onSelectStakeTier(tier);
-    if (roomState && roomState.status === 'lobby' && roomState.stakedCount === 0) {
-      online.setStakeTier(tier);
-    }
-  };
-
-  const handleNicknameChange = (nextName: string) => {
-    onChangePlayerNickname(nextName);
-    if (nextName.trim().length > 0) {
-      online.updateProfile(nextName);
-    }
-  };
-
-  // Atomic First-Write-Wins paint occupancy derived strictly from server roomState
   const getColorHolder = (
-    hex: string,
+    targetHex: string,
   ): { taken: boolean; holderSlotCode?: string; holderName?: string } => {
-    if (!roomState) return { taken: false };
-    const norm = normalizePaintHex(hex);
-    for (const slot of roomState.slots) {
-      if (slot.status === 'waiting') continue;
-      if (slot.playerId === online.playerId) continue;
-      if (normalizePaintHex(slot.paintColor) === norm) {
+    const norm = normalizePaintHex(targetHex);
+    for (const laneIndex of [0, 2, 3] as const) {
+      if (normalizePaintHex(laneColors[laneIndex]) === norm) {
+        const ai = AI_RIVAL_SLOTS[laneIndex];
         return {
           taken: true,
-          holderSlotCode: slot.slotCode,
-          holderName: slot.displayName,
+          holderSlotCode: ai.slotCode,
+          holderName: ai.callsign,
         };
       }
     }
@@ -283,78 +199,85 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
   };
 
   const handleSelectLocalPaintColor = (targetHex: string) => {
-    const holder = getColorHolder(targetHex);
-    if (holder.taken) return;
     const norm = normalizePaintHex(targetHex);
-    onUpdateCarConfig((prev) => ({ ...prev, paintColor: norm }));
-    if (roomState) {
-      online.selectColor(norm);
+    onUpdateCarConfig((prev) => ({
+      ...prev,
+      paintColor: norm,
+      underglowColor: norm,
+    }));
+  };
+
+  const handleCopyRoomCode = async () => {
+    try {
+      await navigator.clipboard.writeText(roomCode);
+      setCopiedCode(true);
+      window.setTimeout(() => setCopiedCode(false), 1800);
+    } catch {
+      setCopiedCode(false);
     }
   };
 
-  const currentClockMs = Math.max(nowMs, Date.now());
-  const escrowRemainingSec =
-    roomState?.escrowExpiresAt != null
-      ? Math.min(60, Math.max(0, Math.ceil((roomState.escrowExpiresAt - currentClockMs) / 1000)))
-      : null;
+  const handleJoinByCodeSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const formatted = normalizeRoomCode(joinCodeInput);
+    if (formatted.length < 4) {
+      setJoinInputError('Enter a valid 6-character room code first');
+      return;
+    }
+    setJoinInputError(null);
+    setJoinedRoomCode(formatted);
+  };
 
-  const countdownSec =
-    roomState?.status === 'countdown' && roomState.countdownRemainingMs != null
-      ? Math.max(1, Math.ceil(roomState.countdownRemainingMs / 1000))
-      : null;
-
-  const projectedPlayerCount = roomState
-    ? Math.max(2, roomState.connectedCount)
-    : 4;
-  const projectedPotUsdc = roomState
-    ? roomState.potFormatted
-    : (
-        Number(wagerBreakdown.stakePerPlayerUsdc.toFixed(2)) *
-        projectedPlayerCount
-      ).toFixed(2);
-
-  const isLocalStaked = localSlot?.status === 'staked';
-  const stakeEditingLocked =
-    Boolean(roomState) &&
-    (roomState!.stakedCount > 0 || roomState!.status !== 'lobby');
+  const handleLaunchRace = () => {
+    if (isLockingEscrow || !hasEnoughUsdcForWager) return;
+    const callsigns: [string, string, string, string] = [
+      AI_RIVAL_SLOTS[0].callsign,
+      playerNickname.trim() || 'RACER_01',
+      AI_RIVAL_SLOTS[2].callsign,
+      AI_RIVAL_SLOTS[3].callsign,
+    ];
+    const addresses: [string, string, string, string] = [
+      AI_RIVAL_SLOTS[0].address,
+      arcWallet.address,
+      AI_RIVAL_SLOTS[2].address,
+      AI_RIVAL_SLOTS[3].address,
+    ];
+    void onStartRace({
+      roomCode: activeRoomDisplayCode,
+      slotCallsigns: callsigns,
+      slotAddresses: addresses,
+      slotColors: laneColors,
+    });
+  };
 
   const gridSlots = DISPLAY_LANE_ORDER.map((laneIndex) => {
-    if (roomState) {
-      const s = roomState.slots[laneIndex];
-      const isLocal = s.playerId !== null && s.playerId === online.playerId;
+    if (laneIndex === 1) {
       return {
         laneIndex,
         laneLabel: LANE_LABELS[laneIndex],
-        slotCode: isLocal ? `${s.slotCode} • YOU` : s.slotCode,
-        isLocalPlayer: isLocal,
-        nickname: s.displayName,
-        walletAddress: s.walletAddress ? shortenAddress(s.walletAddress) : '---',
-        pingMs: isLocal ? online.pingMs : s.pingMs,
-        chassisName:
-          s.status === 'waiting' ? 'Open Slot' : UNIFIED_CAR_MODEL_NAME,
-        paintColor: s.paintColor,
-        status: s.status as OnlineSlotStatus,
-        connected: s.connected,
-        stakeUsdcFormatted: s.stakeUsdcFormatted,
+        slotCode: 'P1 • YOU',
+        isLocalPlayer: true,
+        nickname: playerNickname,
+        walletAddress: shortenAddress(arcWallet.address),
+        pingMs: 12,
+        chassisName: UNIFIED_CAR_MODEL_NAME,
+        paintColor: laneColors[1],
+        isReady: isLocalReady,
       };
     }
 
-    const isLocal = laneIndex === 1;
+    const ai = AI_RIVAL_SLOTS[laneIndex];
     return {
       laneIndex,
       laneLabel: LANE_LABELS[laneIndex],
-      slotCode: isLocal
-        ? `${DEFAULT_SLOT_CODES[laneIndex]} • YOU`
-        : DEFAULT_SLOT_CODES[laneIndex],
-      isLocalPlayer: isLocal,
-      nickname: isLocal ? playerNickname : 'Open Slot',
-      walletAddress: isLocal ? shortenAddress(arcWallet.address) : '---',
-      pingMs: isLocal ? online.pingMs : null,
-      chassisName: isLocal ? UNIFIED_CAR_MODEL_NAME : 'Open Slot',
+      slotCode: ai.slotCode,
+      isLocalPlayer: false,
+      nickname: ai.callsign,
+      walletAddress: shortenAddress(ai.address),
+      pingMs: ai.pingMs,
+      chassisName: UNIFIED_CAR_MODEL_NAME,
       paintColor: laneColors[laneIndex],
-      status: (isLocal ? 'connected' : 'waiting') as OnlineSlotStatus,
-      connected: isLocal,
-      stakeUsdcFormatted: '0.00',
+      isReady: true,
     };
   });
 
@@ -367,73 +290,31 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
     ORION_HUB_V2_ADDRESS,
   );
 
-  const handlePrimaryCtaClick = () => {
-    if (online.connectionStatus !== 'connected') return;
-    if (!roomState) {
-      if (activeTab === 'create_room') {
-        online.createRoom(stakeTierUsdc);
-      } else if (activeTab === 'join_room') {
-        const formatted = normalizeRoomCode(joinCodeInput);
-        if (formatted.length >= 4) {
-          online.joinRoom(formatted);
-        } else {
-          setJoinInputError('Enter a valid 6-character room code first');
-        }
-      } else {
-        online.quickMatch(stakeTierUsdc);
-      }
-      return;
-    }
-
-    if (roomState.status !== 'lobby') return;
-    if (isLocalStaked) {
-      online.unlockStake();
-    } else {
-      online.lockStake();
-    }
-  };
-
-  const primaryCtaDisabled =
-    online.connectionStatus !== 'connected' ||
-    roomState?.status === 'countdown' ||
-    roomState?.status === 'playing' ||
-    (Boolean(roomState) && !isLocalStaked && !hasEnoughUsdcForWager);
+  const primaryCtaDisabled = isLockingEscrow || !hasEnoughUsdcForWager;
 
   const primaryCtaLabel = (() => {
-    if (online.connectionStatus !== 'connected') {
-      return 'Connecting to Live Server...';
-    }
-    if (!roomState) {
-      if (activeTab === 'create_room') return 'Create Private Room —>';
-      if (activeTab === 'join_room') return 'Join Room by Code —>';
-      return `Join Live Lobby (${activeStakeStr} USDC) —>`;
-    }
-    if (roomState.status === 'countdown') {
-      return `Launching in ${countdownSec ?? 3}s...`;
-    }
-    if (roomState.status === 'playing') {
-      return 'Race In Progress...';
-    }
-    if (isLocalStaked) {
-      const needed = Math.max(2, roomState.connectedCount);
-      return `✓ Staked (${roomState.stakedCount}/${needed}) — Click to Unlock`;
+    if (isLockingEscrow) {
+      return 'Locking USDC Escrow...';
     }
     if (!hasEnoughUsdcForWager) {
       return 'Insufficient USDC (Use +50 USDC)';
     }
-    return `Lock ${wagerBreakdown.stakePerPlayerUsdc.toString()} USDC & Ready Up —>`;
+    if (wagerBreakdown.isWagerEnabled) {
+      return `Stake ${wagerBreakdown.stakePerPlayerUsdc.toString()} USDC & Race (Pot ${wagerBreakdown.totalPotUsdc.toString()} USDC) —>`;
+    }
+    return 'Start Free 4P Race —>';
   })();
 
   return (
     <div
       data-testid="multiplayer-main-menu"
-      className="fixed inset-0 z-50 grid h-screen w-screen grid-rows-[auto_1fr] overflow-hidden bg-[#0d0d0f]/85 text-[#f8f8f8]"
+      className="fixed inset-0 z-50 grid h-screen w-screen grid-rows-[auto_1fr] overflow-y-auto lg:overflow-hidden bg-[#0d0d0f]/85 text-[#f8f8f8]"
     >
       {/* SIMULATED PERSPECTIVE VIEWPORT GRID OVERLAY */}
       <div className="viewport-grid-overlay" />
 
       {/* HEADER */}
-      <header className="relative z-10 grid grid-cols-[1fr_auto] items-end border-b border-[rgba(248,248,248,0.1)] bg-[#0d0d0f]/85 px-6 py-4 md:px-8 md:py-6 backdrop-blur-md">
+      <header className="relative z-10 flex flex-col gap-3 sm:grid sm:grid-cols-[1fr_auto] sm:items-end border-b border-[rgba(248,248,248,0.1)] bg-[#0d0d0f]/85 px-4 py-3.5 sm:px-6 sm:py-4 md:px-8 md:py-6 backdrop-blur-md">
         <div>
           <h1 className="font-['Inter',sans-serif] text-2xl sm:text-3xl md:text-4xl font-black uppercase leading-[0.92] tracking-[-0.03em] text-[#f8f8f8]">
             <span className="block">ARC</span>
@@ -441,21 +322,15 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
           </h1>
         </div>
 
-        {/* LIVE ROOM STATUS + GAME MUTE BUTTON + COMPACT ARC TESTNET WALLET BAR */}
-        <div className="flex flex-wrap items-center justify-end gap-2">
+        {/* LOBBY STATUS + GAME MUTE BUTTON + COMPACT ARC TESTNET WALLET BAR */}
+        <div className="flex flex-wrap items-center justify-start sm:justify-end gap-2">
           <div
             data-testid="live-room-badge"
-            className={`px-3.5 py-1.5 font-['Space_Mono',monospace] text-xs font-bold ${
-              roomState
-                ? 'bg-[#2563eb] text-white'
-                : 'border border-[rgba(248,248,248,0.18)] bg-[#16161a] text-[#f8f8f8]'
-            }`}
+            className="bg-[#2563eb] px-3.5 py-1.5 font-['Space_Mono',monospace] text-xs font-bold text-white"
           >
-            {roomState
-              ? `ROOM ${roomState.roomCode} • ${roomState.stakedCount}/${roomState.connectedCount} STAKED`
-              : online.connectionStatus === 'connected'
-                ? 'LIVE SERVER • 2–4P'
-                : 'CONNECTING...'}
+            {activeTab === 'quick_match'
+              ? '4P HIGHWAY • 4/4 READY'
+              : `ROOM ${activeRoomDisplayCode} • 4/4 READY`}
           </div>
 
           <button
@@ -565,26 +440,26 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
       </header>
 
       {/* MAIN */}
-      <main className="relative z-10 grid min-h-0 w-full grid-cols-[300px_1fr] md:grid-cols-[350px_1fr] gap-[1px] bg-[rgba(248,248,248,0.1)] overflow-hidden">
+      <main className="relative z-10 grid min-h-0 w-full grid-cols-1 lg:grid-cols-[350px_1fr] gap-[1px] bg-[rgba(248,248,248,0.1)] lg:overflow-hidden">
         {/* LEFT CONTROLS PANEL */}
-        <aside className="flex h-full w-full flex-col gap-4 justify-self-start bg-[#0d0d0f] p-5 md:p-6 overflow-y-auto">
+        <aside className="flex w-full flex-col gap-4 justify-self-start bg-[#0d0d0f] p-4 sm:p-5 md:p-6 lg:h-full lg:overflow-y-auto">
           <div className="grid grid-cols-1 gap-1.5">
             <button
               type="button"
               data-testid="tab-quick-match"
-              onClick={() => handleSelectTab('quick_match')}
+              onClick={() => setActiveTab('quick_match')}
               className={`cursor-pointer border p-3 text-left font-['Space_Mono',monospace] text-xs uppercase transition ${
                 activeTab === 'quick_match'
                   ? 'border-[#f8f8f8] bg-[#f8f8f8] text-[#0d0d0f] font-bold'
                   : 'border-[rgba(248,248,248,0.1)] bg-transparent text-[#f8f8f8] hover:border-[rgba(248,248,248,0.35)]'
               }`}
             >
-              Quick Match (2–4P)
+              Quick Match (4P)
             </button>
             <button
               type="button"
               data-testid="tab-create-room"
-              onClick={() => handleSelectTab('create_room')}
+              onClick={() => setActiveTab('create_room')}
               className={`cursor-pointer border p-3 text-left font-['Space_Mono',monospace] text-xs uppercase transition ${
                 activeTab === 'create_room'
                   ? 'border-[#f8f8f8] bg-[#f8f8f8] text-[#0d0d0f] font-bold'
@@ -596,7 +471,7 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
             <button
               type="button"
               data-testid="tab-join-room"
-              onClick={() => handleSelectTab('join_room')}
+              onClick={() => setActiveTab('join_room')}
               className={`cursor-pointer border p-3 text-left font-['Space_Mono',monospace] text-xs uppercase transition ${
                 activeTab === 'join_room'
                   ? 'border-[#f8f8f8] bg-[#f8f8f8] text-[#0d0d0f] font-bold'
@@ -608,35 +483,36 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
           </div>
 
           {/* ROOM CODE CONTROLS */}
-
           {activeTab === 'create_room' && (
             <div className="flex flex-col gap-2">
               <div>
                 <span className="block font-['Space_Mono',monospace] text-[0.6rem] uppercase opacity-40">
-                  Private Room Code (Share With Friends)
+                  Private Room Code
                 </span>
-                {roomState ? (
-                  <div className="mt-1.5 flex items-center gap-2">
-                    <span
-                      data-testid="created-room-code"
-                      className="border border-[#2563eb] bg-black px-3 py-1.5 font-['Space_Mono',monospace] text-sm font-bold tracking-[0.2em] text-[#3b82f6]"
-                    >
-                      {roomState.roomCode}
-                    </span>
-                    <button
-                      type="button"
-                      data-testid="btn-copy-room-code"
-                      onClick={handleCopyRoomCode}
-                      className="cursor-pointer border border-[rgba(248,248,248,0.2)] bg-[#16161a] px-2.5 py-1.5 font-['Space_Mono',monospace] text-[0.65rem] uppercase text-[#f8f8f8] hover:border-[#f8f8f8]"
-                    >
-                      {copiedCode ? 'Copied!' : 'Copy Code'}
-                    </button>
-                  </div>
-                ) : (
-                  <p className="mt-1 text-[0.74rem] opacity-70">
-                    Click below to open a private server room and receive a live invite code.
-                  </p>
-                )}
+                <div className="mt-1.5 flex items-center gap-2">
+                  <span
+                    data-testid="created-room-code"
+                    className="border border-[#2563eb] bg-black px-3 py-1.5 font-['Space_Mono',monospace] text-sm font-bold tracking-[0.2em] text-[#3b82f6]"
+                  >
+                    {roomCode}
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="btn-copy-room-code"
+                    onClick={() => void handleCopyRoomCode()}
+                    className="cursor-pointer border border-[rgba(248,248,248,0.2)] bg-[#16161a] px-2.5 py-1.5 font-['Space_Mono',monospace] text-[0.65rem] uppercase text-[#f8f8f8] hover:border-[#f8f8f8]"
+                  >
+                    {copiedCode ? 'Copied!' : 'Copy'}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="btn-new-room"
+                    onClick={() => setRoomCode(generateRoomCode())}
+                    className="cursor-pointer border border-[rgba(248,248,248,0.2)] bg-[#16161a] px-2.5 py-1.5 font-['Space_Mono',monospace] text-[0.65rem] uppercase text-[#f8f8f8] hover:border-[#2563eb]"
+                  >
+                    New
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -672,12 +548,12 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                   </button>
                 </div>
               </div>
-              {roomState && (
+              {joinedRoomCode && (
                 <div
                   data-testid="join-room-status"
                   className="font-['Space_Mono',monospace] text-xs text-[#4ade80]"
                 >
-                  Connected to Room #{roomState.roomCode}
+                  Connected to Room #{joinedRoomCode} (3 AI Bots Ready)
                 </div>
               )}
               {joinInputError && (
@@ -688,25 +564,6 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
             </form>
           )}
 
-          {/* SERVER ERROR / NOTICE BANNER */}
-          {online.lastError && (
-            <div
-              data-testid="online-error-banner"
-              className="border border-[#f43f5e]/60 bg-[#f43f5e]/15 px-3 py-2 font-['Space_Mono',monospace] text-[0.66rem] text-[#fda4af]"
-            >
-              {online.lastError}
-            </div>
-          )}
-
-          {online.lastNotice && !online.lastError && (
-            <div
-              data-testid="online-notice-banner"
-              className="border border-[#2563eb]/40 bg-[#2563eb]/10 px-3 py-1.5 font-['Space_Mono',monospace] text-[0.64rem] text-[#93c5fd]"
-            >
-              {online.lastNotice}
-            </div>
-          )}
-
           {/* ARC USDC SELF-WAGER POOL (WINNER TAKES ALL) + ORION PROTOCOL */}
           <div
             data-testid="orion-wager-panel"
@@ -714,7 +571,7 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
           >
             <div className="flex items-center justify-between gap-2">
               <span className="font-['Space_Mono',monospace] text-[0.58rem] font-bold uppercase text-[#3b82f6] whitespace-nowrap">
-                USDC Escrow • Winner Takes All
+                USDC Self-Wager • Winner Takes All
               </span>
               <a
                 href={hubExplorerUrl}
@@ -730,22 +587,17 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
             {/* Stake Tier Buttons */}
             <div className="grid grid-cols-4 gap-1">
               {STAKE_TIERS_USDC.map((tier) => {
-                const isSelected = activeStakeStr.trim() === tier;
+                const isSelected = stakeTierUsdc.trim() === tier;
                 return (
                   <button
                     key={tier}
                     type="button"
-                    disabled={stakeEditingLocked}
                     data-testid={`stake-tier-${tier}`}
-                    onClick={() => handleStakeTierChange(tier)}
-                    className={`border py-1.5 font-['Space_Mono',monospace] text-[0.65rem] font-bold uppercase transition ${
-                      stakeEditingLocked
-                        ? 'cursor-not-allowed opacity-50'
-                        : 'cursor-pointer'
-                    } ${
+                    onClick={() => onSelectStakeTier(tier)}
+                    className={`cursor-pointer border py-1.5 font-['Space_Mono',monospace] text-xs font-bold transition ${
                       isSelected
                         ? 'border-[#2563eb] bg-[#2563eb] text-white'
-                        : 'border-[rgba(248,248,248,0.12)] bg-black text-[#f8f8f8] opacity-75 hover:opacity-100'
+                        : 'border-[rgba(248,248,248,0.15)] bg-black text-[#f8f8f8] hover:border-[#2563eb]'
                     }`}
                   >
                     ${tier}
@@ -771,8 +623,7 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                   data-testid="input-custom-stake-usdc"
                   type="text"
                   inputMode="decimal"
-                  disabled={stakeEditingLocked}
-                  value={activeStakeStr}
+                  value={stakeTierUsdc}
                   onChange={(e) => {
                     const raw = e.target.value.replace(/[^0-9.]/g, '');
                     const parts = raw.split('.');
@@ -782,10 +633,10 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                         : parts.length === 2
                           ? `${parts[0]}.${parts[1].slice(0, 6)}`
                           : raw;
-                    handleStakeTierChange(sanitized as StakeTierUsdc);
+                    onSelectStakeTier(sanitized as StakeTierUsdc);
                   }}
                   placeholder="Enter amount (e.g. 5)"
-                  className="w-full bg-transparent px-2 py-1.5 font-['Space_Mono',monospace] text-xs font-bold text-white focus:outline-none disabled:opacity-50"
+                  className="w-full bg-transparent px-2 py-1.5 font-['Space_Mono',monospace] text-xs font-bold text-white focus:outline-none"
                 />
                 <span className="pr-2.5 font-['Space_Mono',monospace] text-[0.6rem] uppercase opacity-50">
                   USDC
@@ -808,43 +659,26 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                   </span>
                 </div>
                 <div className="flex justify-between border-t border-[rgba(248,248,248,0.08)] pt-1">
-                  <span className="opacity-75 font-bold">
-                    WINNER POT ({projectedPlayerCount}×):
-                  </span>
+                  <span className="opacity-75 font-bold">WINNER POT (4×):</span>
                   <span
                     data-testid="wager-total-pot"
                     className="font-bold text-[#4ade80]"
                   >
-                    {projectedPotUsdc} USDC
+                    {wagerBreakdown.totalPotUsdc.toFixed(2)} USDC
                   </span>
                 </div>
-
-                {escrowRemainingSec !== null && (
-                  <div
-                    data-testid="escrow-timeout-banner"
-                    className="mt-1 border border-[#fbb124]/40 bg-[#fbb124]/10 px-2 py-1 text-[0.6rem] text-[#fcd34d]"
-                  >
-                    PRE-RACE TIMER: {escrowRemainingSec}s (auto-refund if lobby does not launch)
-                  </div>
-                )}
-
                 <div className="mt-0.5 flex justify-between text-[0.58rem] opacity-55">
                   <span>drand evmnet:</span>
                   <span>
-                    {roomState
-                      ? `Round #${roomState.orionRound}`
-                      : orionTelemetry?.latestDrandRound
-                        ? `Round #${orionTelemetry.latestDrandRound}`
-                        : '3s Beacon'}
+                    {orionTelemetry?.latestDrandRound
+                      ? `Round #${orionTelemetry.latestDrandRound}`
+                      : '3s Beacon'}
                   </span>
-                </div>
-                <div className="text-[0.56rem] opacity-45">
-                  Mid-race disconnect forfeits locked stake to pot.
                 </div>
               </div>
             ) : (
               <div className="font-['Space_Mono',monospace] text-[0.63rem] opacity-60">
-                Enter a USDC stake amount (&gt; 0) to wager with live players.
+                Free practice mode (0 USDC staked). Enter an amount &gt; 0 to wager.
               </div>
             )}
 
@@ -895,52 +729,15 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
 
           {/* ACTION AREA */}
           <div className="mt-auto flex flex-col gap-2.5">
-            {roomState ? (
-              <div className="grid grid-cols-2 gap-2">
-                {activeTab === 'create_room' && (
-                  <button
-                    type="button"
-                    data-testid="btn-new-room"
-                    onClick={() => online.createRoom(stakeTierUsdc)}
-                    className="cursor-pointer border border-[#2563eb] bg-transparent p-2.5 text-[0.68rem] font-bold uppercase text-[#3b82f6] transition hover:bg-[#2563eb]/15"
-                  >
-                    New Room
-                  </button>
-                )}
-                <button
-                  type="button"
-                  data-testid="btn-leave-room"
-                  onClick={() => online.leaveRoom()}
-                  className={`cursor-pointer border border-[rgba(248,248,248,0.2)] bg-transparent p-2.5 text-[0.68rem] font-bold uppercase text-[#f8f8f8] transition hover:border-[#f43f5e] hover:text-[#f43f5e] ${
-                    activeTab === 'create_room' ? '' : 'col-span-2'
-                  }`}
-                >
-                  Leave Room #{roomState.roomCode}
-                </button>
-              </div>
-            ) : activeTab === 'quick_match' ? (
-              <button
-                type="button"
-                data-testid="btn-search-match"
-                disabled={online.connectionStatus !== 'connected'}
-                onClick={() => online.quickMatch(stakeTierUsdc)}
-                className="cursor-pointer border border-[#2563eb] bg-transparent p-3 text-xs font-bold uppercase text-[#3b82f6] transition hover:bg-[#2563eb]/15 disabled:opacity-40"
-              >
-                Find Live Room (2–4P)
-              </button>
-            ) : null}
-
             <button
               type="button"
               data-testid="btn-instant-race"
               disabled={primaryCtaDisabled}
-              onClick={handlePrimaryCtaClick}
+              onClick={handleLaunchRace}
               className={`border-none p-4 text-sm md:text-base font-black uppercase tracking-[0.06em] text-white transition ${
                 primaryCtaDisabled
                   ? 'bg-[#16161a] opacity-50 cursor-not-allowed'
-                  : isLocalStaked
-                    ? 'cursor-pointer bg-[#15803d] hover:bg-[#16a34a]'
-                    : 'cursor-pointer bg-[#2563eb] hover:bg-[#3b82f6]'
+                  : 'cursor-pointer bg-[#2563eb] hover:bg-[#3b82f6]'
               }`}
             >
               {primaryCtaLabel}
@@ -949,13 +746,13 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
         </aside>
 
         {/* RIGHT 2x2 GRID PANEL + RECENT RACES DASHBOARD */}
-        <section className="grid h-full min-h-0 grid-cols-[repeat(2,minmax(300px,450px))] auto-rows-max content-start justify-center gap-3.5 bg-[#0d0d0f]/40 px-8 py-4 overflow-y-auto">
+        <section className="grid w-full min-h-0 grid-cols-1 sm:grid-cols-2 lg:grid-cols-[repeat(2,minmax(300px,450px))] auto-rows-max content-start justify-center gap-3.5 bg-[#0d0d0f]/40 px-4 py-4 sm:px-6 lg:h-full lg:px-8 lg:overflow-y-auto">
           {gridSlots.map((slot) => (
             <div
               key={slot.laneIndex}
               data-testid={`lobby-slot-${slot.laneIndex}`}
-              data-slot-status={slot.status}
-              className={`relative flex w-full max-w-[450px] min-h-[192px] flex-col justify-between border bg-[#16161a] px-5 py-4 transition ${
+              data-slot-status="ready"
+              className={`relative flex w-full max-w-[450px] mx-auto sm:mx-0 min-h-[192px] flex-col justify-between border bg-[#16161a] px-4 sm:px-5 py-4 transition ${
                 slot.isLocalPlayer
                   ? 'border-[#2563eb] shadow-[0_0_40px_rgba(37,99,235,0.18)]'
                   : 'border-[rgba(248,248,248,0.1)]'
@@ -974,11 +771,7 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                     {slot.slotCode}
                   </span>
 
-                  {slot.status === 'staked' ? (
-                    <span className="border border-[#4ade80]/50 bg-[#4ade80]/15 px-2 py-0.5 font-['Space_Mono',monospace] text-[0.68rem] font-bold text-[#4ade80]">
-                      STAKED: {slot.stakeUsdcFormatted} USDC
-                    </span>
-                  ) : slot.status !== 'waiting' && wagerBreakdown.isWagerEnabled ? (
+                  {wagerBreakdown.isWagerEnabled ? (
                     <span className="border border-[#2563eb]/50 bg-[#2563eb]/15 px-2 py-0.5 font-['Space_Mono',monospace] text-[0.68rem] font-bold text-[#3b82f6]">
                       STAKE: {wagerBreakdown.stakePerPlayerUsdc.toString()} USDC
                     </span>
@@ -1004,25 +797,17 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                       type="text"
                       value={playerNickname}
                       maxLength={16}
-                      onChange={(e) => handleNicknameChange(e.target.value)}
+                      onChange={(e) => onChangePlayerNickname(e.target.value)}
                       className="mt-1 w-full border border-[rgba(248,248,248,0.1)] bg-black px-2.5 py-1.5 font-['Space_Mono',monospace] text-[0.95rem] text-white focus:border-[#2563eb] focus:outline-none"
                     />
                   </div>
                 ) : (
                   <div>
                     <span className="block font-['Space_Mono',monospace] text-[0.64rem] uppercase opacity-40">
-                      {slot.status === 'waiting'
-                        ? 'Live Human Slot'
-                        : `Driver (${slot.walletAddress})`}
+                      AI Rival ({slot.walletAddress})
                     </span>
-                    <div
-                      className={`mt-0.5 text-lg font-bold ${
-                        slot.status === 'waiting' ? 'opacity-45' : ''
-                      }`}
-                    >
-                      {slot.status === 'waiting'
-                        ? 'Waiting for player...'
-                        : slot.nickname}
+                    <div className="mt-0.5 text-lg font-bold">
+                      {slot.nickname}
                     </div>
                   </div>
                 )}
@@ -1049,49 +834,27 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                             normalizePaintHex(slot.paintColor) ===
                             sw.hex.toLowerCase();
                           const holder = getColorHolder(sw.hex);
-                          const isLockedByOther = holder.taken && !isSelected;
                           return (
                             <button
                               key={sw.hex}
                               type="button"
                               data-testid={`paint-swatch-${sw.name.toLowerCase()}`}
-                              data-occupied={isLockedByOther ? 'true' : 'false'}
-                              disabled={isLockedByOther}
-                              aria-disabled={isLockedByOther}
-                              aria-label={
-                                isLockedByOther
-                                  ? `${sw.name} (Occupied by ${holder.holderSlotCode})`
-                                  : `Select ${sw.name} paint`
-                              }
+                              data-occupied={holder.taken ? 'true' : 'false'}
+                              aria-label={`Select ${sw.name} paint`}
                               onClick={() => handleSelectLocalPaintColor(sw.hex)}
-                              className={`relative flex h-[18px] w-[18px] items-center justify-center transition ${
-                                isLockedByOther
-                                  ? 'cursor-not-allowed opacity-40'
-                                  : 'cursor-pointer hover:scale-110'
-                              }`}
+                              className="relative flex h-[18px] w-[18px] cursor-pointer items-center justify-center transition hover:scale-110"
                               style={{
                                 backgroundColor: sw.hex,
                                 border: isSelected
                                   ? '2px solid #ffffff'
-                                  : isLockedByOther
-                                    ? '1px solid rgba(255,255,255,0.25)'
-                                    : '1px solid rgba(255,255,255,0.15)',
+                                  : '1px solid rgba(255,255,255,0.2)',
                               }}
                               title={
-                                isLockedByOther
-                                  ? `${sw.name} — Occupied by ${holder.holderSlotCode} (${holder.holderName})`
-                                  : `${sw.name} (Available)`
+                                holder.taken
+                                  ? `${sw.name} — Click to claim (${holder.holderSlotCode} auto-swaps)`
+                                  : `${sw.name}`
                               }
-                            >
-                              {isLockedByOther && (
-                                <span
-                                  aria-hidden="true"
-                                  className="pointer-events-none select-none font-['Space_Mono',monospace] text-[10px] font-bold leading-none text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.95)]"
-                                >
-                                  ×
-                                </span>
-                              )}
-                            </button>
+                            />
                           );
                         })}
                       </div>
@@ -1100,21 +863,13 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                         data-testid={`slot-color-badge-${slot.laneIndex}`}
                         className="mt-1.5 flex items-center gap-2"
                       >
-                        {slot.status !== 'waiting' ? (
-                          <>
-                            <span
-                              className="inline-block h-[14px] w-[14px] shrink-0 border border-white/40"
-                              style={{ backgroundColor: slot.paintColor }}
-                            />
-                            <span className="font-['Space_Mono',monospace] text-[0.64rem] uppercase opacity-75">
-                              {getPaintSwatchName(slot.paintColor)} • Locked
-                            </span>
-                          </>
-                        ) : (
-                          <span className="font-['Space_Mono',monospace] text-[0.64rem] uppercase opacity-40">
-                            No Color Locked • Zero AI Bots
-                          </span>
-                        )}
+                        <span
+                          className="inline-block h-[14px] w-[14px] shrink-0 border border-white/40"
+                          style={{ backgroundColor: slot.paintColor }}
+                        />
+                        <span className="font-['Space_Mono',monospace] text-[0.64rem] uppercase opacity-75">
+                          {getPaintSwatchName(slot.paintColor)} • AI Bot
+                        </span>
                       </div>
                     )}
                   </div>
@@ -1128,54 +883,26 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
                     <button
                       type="button"
                       data-testid="btn-toggle-ready"
-                      disabled={
-                        !roomState ||
-                        roomState.status !== 'lobby' ||
-                        (!isLocalStaked && !hasEnoughUsdcForWager)
-                      }
-                      onClick={() =>
-                        isLocalStaked ? online.unlockStake() : online.lockStake()
-                      }
-                      className={`border-none px-3.5 py-1 text-xs font-bold uppercase transition ${
-                        !roomState || roomState.status !== 'lobby'
-                          ? 'bg-[rgba(248,248,248,0.12)] text-[#f8f8f8] opacity-55 cursor-not-allowed'
-                          : isLocalStaked
-                            ? 'cursor-pointer bg-[#4ade80] text-black'
-                            : 'cursor-pointer bg-[#2563eb] text-white hover:bg-[#3b82f6]'
+                      onClick={() => setIsLocalReady((prev) => !prev)}
+                      className={`cursor-pointer border-none px-3.5 py-1 text-xs font-bold uppercase transition ${
+                        isLocalReady
+                          ? 'bg-[#4ade80] text-black'
+                          : 'bg-[#2563eb] text-white hover:bg-[#3b82f6]'
                       }`}
                     >
-                      {!roomState
-                        ? 'JOIN A ROOM'
-                        : isLocalStaked
-                          ? '✓ STAKED'
-                          : 'LOCK STAKE'}
+                      {isLocalReady ? '✓ READY' : 'READY UP'}
                     </button>
                     <span className="font-['Space_Mono',monospace] text-[0.66rem] uppercase opacity-50">
-                      {online.pingMs}ms
+                      {slot.pingMs}ms
                     </span>
                   </>
                 ) : (
                   <>
-                    <span
-                      className="font-['Space_Mono',monospace] text-xs uppercase"
-                      style={{
-                        color:
-                          slot.status === 'staked'
-                            ? '#4ade80'
-                            : slot.status === 'connected'
-                              ? '#3b82f6'
-                              : '#fbb124',
-                      }}
-                    >
-                      ●{' '}
-                      {slot.status === 'staked'
-                        ? 'STAKED'
-                        : slot.status === 'connected'
-                          ? 'CONNECTED'
-                          : 'OPEN SLOT'}
+                    <span className="font-['Space_Mono',monospace] text-xs uppercase text-[#4ade80]">
+                      ● READY • AI BOT
                     </span>
                     <span className="font-['Space_Mono',monospace] text-[0.66rem] uppercase opacity-50">
-                      {slot.pingMs !== null ? `${slot.pingMs}ms` : '---'}
+                      {slot.pingMs}ms
                     </span>
                   </>
                 )}

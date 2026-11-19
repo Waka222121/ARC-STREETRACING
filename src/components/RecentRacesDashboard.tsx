@@ -112,7 +112,7 @@ export const RecentRacesDashboard: React.FC<RecentRacesDashboardProps> = ({
     <div
       id="recent-races-dashboard"
       data-testid="recent-races-dashboard"
-      className="col-span-2 w-full max-w-[916px] border border-[rgba(248,248,248,0.12)] bg-[#16161a] px-5 py-4"
+      className="col-span-full w-full max-w-[916px] mx-auto sm:mx-0 border border-[rgba(248,248,248,0.12)] bg-[#16161a] px-4 sm:px-5 py-4"
     >
       <div className="mb-2 flex items-center justify-between border-b border-[rgba(248,248,248,0.1)] pb-2">
         <div className="flex items-center gap-2.5">

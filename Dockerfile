@@ -1,4 +1,4 @@
-# Multi-stage production Dockerfile for Google Cloud Run
+# Multi-stage production Dockerfile for Fly.io
 # Serves Express REST API (/api/*), authoritative 60 Hz WebSocket server (/ws), and built Vite SPA (dist/) on $PORT
 
 FROM node:22-alpine AS builder
@@ -17,6 +17,7 @@ FROM node:22-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
+ENV HOST=0.0.0.0
 ENV PORT=8080
 
 COPY package.json package-lock.json ./

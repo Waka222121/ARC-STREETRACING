@@ -1,0 +1,41 @@
+# Fly.io configuration for ARC STREETRACING
+# Stateful single-instance 60 Hz Express + WebSocket (/ws) + Vite full-stack server
+
+app = "arc-streetracing"
+primary_region = "fra"
+kill_signal = "SIGTERM"
+kill_timeout = "5s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  CORS_ORIGINS = "*"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep the stateful 60 Hz multiplayer room server always warm (1 machine)
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 200
+    soft_limit = 150
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/api/health"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
