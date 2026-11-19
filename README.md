@@ -6,7 +6,7 @@
 
 - **Instant 4P Highway Survival**: Launch straight into a 4-lane highway race with `P1 • YOU` + 3 AI bots driving identical **Lancer Evo VIII MR** chassis with auto-swapping unique paint liveries.
 - **Zero-HUD Immersion**: Clean fullscreen 3D gameplay during active races with procedural Web Audio engine synthesis and turbo blow-off audio.
-- **Arc Testnet USDC Wagering**: Built-in embedded Arc Testnet wallet (with `+50 USDC` faucet) plus MetaMask / Rabby support (`chainId: 5042002`), preset (`$1`, `$5`, `$10`, `$25`) and custom USDC stakes, winner-takes-all `4×` pot, and post-race Orion `RandomnessHub v2` drand beacon proof.
+- **Arc Testnet USDC Wagering (Personal Wallets)**: Every player connects their own EVM wallet via EIP-6963 / EIP-1193 (**MetaMask, Rabby, Coinbase Wallet, OKX, Phantom**, etc.) with automatic Arc Testnet (`chainId: 5042002`) switching, live `accountsChanged` / `chainChanged` sync, preset (`$1`, `$5`, `$10`, `$25`) and custom USDC stakes, winner-takes-all `4×` pot, and post-race Orion `RandomnessHub v2` drand beacon proof. Also includes optional **Free Practice ($0)** and a local **Demo Wallet** for visitors without a browser wallet.
 - **Desktop & Mobile Controls**:
   - **Keyboard**: `A` / `D` or `←` / `→` to switch lanes, `C` to cycle camera, `M` to mute audio, `Esc` / `P` to return to lobby.
   - **Touch / Mouse**: Tap the left or right half of the screen during a race to switch lanes.

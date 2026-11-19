@@ -16,12 +16,19 @@ import {
   calculateTargetRoundForRequest,
   computeWagerBreakdown,
   connectInjectedArcWallet,
+  createDisconnectedArcWallet,
   deriveWinnerLaneFromRandomness,
+  disconnectArcWallet,
+  DiscoveredWalletProvider,
   loadEmbeddedArcWallet,
+  refreshInjectedArcWallet,
   resolveOrionBeaconRandomness,
+  restoreInjectedArcWallet,
   saveEmbeddedArcBalance,
   StakeTierUsdc,
   submitInjectedOrionRequest,
+  subscribeDiscoveredWallets,
+  subscribeInjectedWalletEvents,
 } from './game/arcOrionClient';
 import { soundEngine } from './game/audio';
 import { resolveUniqueLanePaintColors } from './game/physics';
@@ -106,9 +113,13 @@ export default function App() {
   >(() => resolveUniqueLanePaintColors(DEFAULT_CAR_CONFIG.paintColor));
 
   // Arc Testnet Wallet + Orion RandomnessHub v2 Escrow states
+  // Starts disconnected so every public player connects their own personal wallet (MetaMask, Rabby, etc.)
   const [arcWallet, setArcWallet] = useState<ArcWalletState>(() =>
-    loadEmbeddedArcWallet(),
+    createDisconnectedArcWallet(),
   );
+  const [discoveredWallets, setDiscoveredWallets] = useState<
+    DiscoveredWalletProvider[]
+  >([]);
   const [stakeTierUsdc, setStakeTierUsdc] = useState<StakeTierUsdc>('5');
   const [walletStatusMessage, setWalletStatusMessage] = useState<string | null>(
     null,
@@ -117,6 +128,7 @@ export default function App() {
   const [lastSettledEscrow, setLastSettledEscrow] =
     useState<ActiveRaceEscrow | null>(null);
   const activeEscrowRef = useRef<ActiveRaceEscrow | null>(null);
+  const restoredOnceRef = useRef<boolean>(false);
 
   const [trackId] = useState<TrackId>('olympic_circuit');
   const [rivalDifficulty] = useState<RivalDifficulty>('pro');
@@ -166,26 +178,98 @@ export default function App() {
     }
   }, [recentRaces]);
 
-  const handleConnectInjectedWallet = useCallback(async () => {
-    try {
-      setWalletStatusMessage(
-        `Connecting to Arc Testnet (${ARC_TESTNET_CHAIN_ID})...`,
-      );
-      const connected = await connectInjectedArcWallet();
-      setArcWallet(connected);
-      setWalletStatusMessage('Connected to MetaMask / Rabby on Arc Testnet');
-    } catch (err) {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : 'Could not connect browser wallet';
-      setWalletStatusMessage(msg);
-    }
+  // Discover installed EIP-6963 / EIP-1193 wallets and silently restore an already-authorized session
+  useEffect(() => {
+    let active = true;
+    const unsubscribe = subscribeDiscoveredWallets((wallets) => {
+      if (!active) return;
+      setDiscoveredWallets(wallets);
+      if (!restoredOnceRef.current) {
+        restoredOnceRef.current = true;
+        void restoreInjectedArcWallet(wallets).then((restored) => {
+          if (active && restored) {
+            setArcWallet(restored);
+          }
+        });
+      }
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
+
+  // Keep player's personal wallet synced if they switch account or network inside MetaMask / Rabby
+  useEffect(() => {
+    if (arcWallet.mode !== 'injected_eip1193') return;
+    let active = true;
+    const unsubscribe = subscribeInjectedWalletEvents({
+      onAccountsChanged: (accounts) => {
+        if (!active) return;
+        if (accounts.length === 0) {
+          setArcWallet(disconnectArcWallet());
+          setWalletStatusMessage('Wallet disconnected');
+          return;
+        }
+        void refreshInjectedArcWallet(accounts[0]).then((updated) => {
+          if (active && updated) {
+            setArcWallet(updated);
+            setWalletStatusMessage('Switched wallet account');
+          }
+        });
+      },
+      onChainChanged: (chainId) => {
+        if (!active) return;
+        if (chainId !== ARC_TESTNET_CHAIN_ID) {
+          setWalletStatusMessage(
+            `Please switch wallet network to Arc Testnet (${ARC_TESTNET_CHAIN_ID}).`,
+          );
+        } else {
+          setWalletStatusMessage(null);
+        }
+        void refreshInjectedArcWallet(arcWallet.address).then((updated) => {
+          if (active && updated) {
+            setArcWallet(updated);
+          }
+        });
+      },
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [arcWallet.mode, arcWallet.address]);
+
+  const handleConnectInjectedWallet = useCallback(
+    async (selected?: DiscoveredWalletProvider) => {
+      try {
+        setWalletStatusMessage(
+          `Connecting ${selected?.name ?? 'wallet'} to Arc Testnet (${ARC_TESTNET_CHAIN_ID})...`,
+        );
+        const connected = await connectInjectedArcWallet(selected);
+        setArcWallet(connected);
+        setWalletStatusMessage(
+          `Connected ${connected.providerName ?? 'Wallet'} on Arc Testnet`,
+        );
+      } catch (err) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Could not connect browser wallet';
+        setWalletStatusMessage(msg);
+      }
+    },
+    [],
+  );
+
+  const handleDisconnectWallet = useCallback(() => {
+    setArcWallet(disconnectArcWallet());
+    setWalletStatusMessage('Wallet disconnected');
   }, []);
 
   const handleSwitchToEmbeddedWallet = useCallback(() => {
     setArcWallet(loadEmbeddedArcWallet());
-    setWalletStatusMessage('Switched to Embedded Arc Testnet Wallet');
+    setWalletStatusMessage('Switched to Local Demo Wallet (Testnet Practice)');
   }, []);
 
   const handleFaucetTopUpUsdc = useCallback(() => {
@@ -193,7 +277,7 @@ export default function App() {
       if (prev.mode !== 'embedded_arc') return prev;
       return saveEmbeddedArcBalance(prev.balanceRawUsdc6 + FAUCET_MINT_USDC6);
     });
-    setWalletStatusMessage('+50.00 Testnet USDC minted to embedded wallet');
+    setWalletStatusMessage('+50.00 Demo USDC added');
   }, []);
 
   const handleStartRace = useCallback(
@@ -211,7 +295,7 @@ export default function App() {
       ];
       const addresses: [string, string, string, string] = meta?.slotAddresses ?? [
         '0x9a2F4401B7C1120E38c5D8496c1aB02E8F41C202',
-        arcWallet.address,
+        arcWallet.address || '0x0000000000000000000000000000000000000000',
         '0x4eB80219cA7410F93e20A8814d6E319B12D0A103',
         '0xD31c7840E290F4b16A55C2398E71024a91B7F404',
       ];
@@ -220,9 +304,18 @@ export default function App() {
       setLobbySlotOccupancy([true, true, true, true]);
 
       if (breakdown.isWagerEnabled) {
+        if (arcWallet.mode === 'disconnected') {
+          setWalletStatusMessage(
+            'Connect your personal wallet to stake USDC, or switch to Free ($0) mode.',
+          );
+          return;
+        }
+
         if (arcWallet.balanceRawUsdc6 < breakdown.playerTotalLockUsdc.raw) {
           setWalletStatusMessage(
-            'Insufficient USDC balance — click +50 USDC to top up.',
+            arcWallet.mode === 'injected_eip1193'
+              ? 'Insufficient Arc Testnet USDC — top up via Arc Testnet Faucet or play Free ($0).'
+              : 'Insufficient Demo USDC balance — click +50 USDC to top up.',
           );
           return;
         }
@@ -232,12 +325,15 @@ export default function App() {
         try {
           if (arcWallet.mode === 'injected_eip1193') {
             setWalletStatusMessage(
-              'Confirm Orion RandomnessHub v2 wager tx in wallet...',
+              'Confirm Orion RandomnessHub v2 wager tx in your wallet...',
             );
             txHash = await submitInjectedOrionRequest(
               arcWallet.address,
               breakdown.relayerRewardGas18,
             );
+            void refreshInjectedArcWallet(arcWallet.address).then((updated) => {
+              if (updated) setArcWallet(updated);
+            });
           } else {
             const updatedWallet = saveEmbeddedArcBalance(
               arcWallet.balanceRawUsdc6 - breakdown.playerTotalLockUsdc.raw,
@@ -430,9 +526,11 @@ export default function App() {
           onSlotOccupancyChange={setLobbySlotOccupancy}
           onSlotColorsChange={setLobbySlotColors}
           arcWallet={arcWallet}
+          discoveredWallets={discoveredWallets}
           stakeTierUsdc={stakeTierUsdc}
           onSelectStakeTier={setStakeTierUsdc}
           onConnectInjectedWallet={handleConnectInjectedWallet}
+          onDisconnectWallet={handleDisconnectWallet}
           onSwitchToEmbeddedWallet={handleSwitchToEmbeddedWallet}
           onFaucetTopUpUsdc={handleFaucetTopUpUsdc}
           isLockingEscrow={isLockingEscrow}

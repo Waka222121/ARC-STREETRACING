@@ -30,7 +30,7 @@ export const STAKE_TIERS_USDC: readonly string[] = [
   '25',
 ];
 
-export type WalletMode = 'embedded_arc' | 'injected_eip1193';
+export type WalletMode = 'disconnected' | 'embedded_arc' | 'injected_eip1193';
 
 export interface ArcWalletState {
   mode: WalletMode;
@@ -40,6 +40,7 @@ export interface ArcWalletState {
   balanceRawUsdc6: bigint; // 6-decimal raw units
   balanceRawGas18: bigint; // 18-decimal native gas units on Arc
   isConnected: boolean;
+  providerName?: string;
 }
 
 export interface WagerBreakdown {
@@ -197,7 +198,23 @@ export function formatUsdcDisplay(amount6: Amount): string {
 }
 
 /**
- * Generates or loads a persistent embedded Arc Testnet wallet address & balance.
+ * Returns a clean disconnected wallet state so each public player connects their own personal wallet.
+ */
+export function createDisconnectedArcWallet(): ArcWalletState {
+  return {
+    mode: 'disconnected',
+    address: '',
+    chainId: ARC_TESTNET_CHAIN_ID,
+    balanceUsdc: '0.00',
+    balanceRawUsdc6: 0n,
+    balanceRawGas18: 0n,
+    isConnected: false,
+    providerName: undefined,
+  };
+}
+
+/**
+ * Generates or loads a persistent local demo Arc Testnet wallet address & balance.
  */
 export function loadEmbeddedArcWallet(): ArcWalletState {
   const STORAGE_ADDR_KEY = 'olympic_arc_embedded_address_v1';
@@ -241,6 +258,7 @@ export function loadEmbeddedArcWallet(): ArcWalletState {
     balanceRawUsdc6: amount6.raw,
     balanceRawGas18: amount18.raw,
     isConnected: true,
+    providerName: 'Demo Wallet',
   };
 }
 
@@ -265,38 +283,154 @@ export function saveEmbeddedArcBalance(newRawUsdc6: bigint): ArcWalletState {
   };
 }
 
-interface Eip1193Provider {
+export interface Eip1193Provider {
   request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+  on?: (event: string, listener: (...args: unknown[]) => void) => void;
+  removeListener?: (
+    event: string,
+    listener: (...args: unknown[]) => void,
+  ) => void;
+  isMetaMask?: boolean;
+  isRabby?: boolean;
+  isCoinbaseWallet?: boolean;
+  isPhantom?: boolean;
+  isOkxWallet?: boolean;
+  isTrust?: boolean;
 }
 
-function getInjectedProvider(): Eip1193Provider | null {
+export interface DiscoveredWalletProvider {
+  uuid: string;
+  name: string;
+  rdns: string;
+  icon?: string;
+  provider: Eip1193Provider;
+}
+
+const WALLET_DISCONNECTED_FLAG_KEY = 'arc_wallet_explicit_disconnect_v1';
+const WALLET_LAST_RDNS_KEY = 'arc_wallet_last_rdns_v1';
+
+let activeInjectedProvider: Eip1193Provider | null = null;
+let activeInjectedProviderName: string | undefined = undefined;
+
+function inferInjectedProviderName(provider: Eip1193Provider): string {
+  if (provider.isRabby) return 'Rabby';
+  if (provider.isCoinbaseWallet) return 'Coinbase Wallet';
+  if (provider.isPhantom) return 'Phantom';
+  if (provider.isOkxWallet) return 'OKX Wallet';
+  if (provider.isTrust) return 'Trust Wallet';
+  if (provider.isMetaMask) return 'MetaMask';
+  return 'Browser Wallet';
+}
+
+function getFallbackInjectedProvider(): Eip1193Provider | null {
   if (typeof window === 'undefined') return null;
   const anyWin = window as unknown as { ethereum?: Eip1193Provider };
   return anyWin.ethereum ?? null;
 }
 
+function getActiveInjectedProvider(): Eip1193Provider | null {
+  return activeInjectedProvider ?? getFallbackInjectedProvider();
+}
+
 /**
- * Connects to an injected EIP-1193 wallet (MetaMask / Rabby), switches/adds Arc Testnet (5042002),
- * and reads the native 18-decimal USDC balance, converting it safely via `gasTokenToUsdc`.
+ * Subscribes to EIP-6963 multi-wallet announcements (MetaMask, Rabby, Coinbase, Phantom, OKX, etc.)
+ * and falls back to `window.ethereum` if no EIP-6963 providers announce themselves.
  */
-export async function connectInjectedArcWallet(): Promise<ArcWalletState> {
-  const provider = getInjectedProvider();
-  if (!provider) {
-    throw new Error(
-      'No browser wallet detected. Using built-in Arc Testnet Wallet instead.',
-    );
+export function subscribeDiscoveredWallets(
+  onUpdate: (wallets: DiscoveredWalletProvider[]) => void,
+): () => void {
+  if (typeof window === 'undefined') return () => {};
+
+  const byKey = new Map<string, DiscoveredWalletProvider>();
+
+  const emit = () => {
+    const list = Array.from(byKey.values());
+    if (list.length === 0) {
+      const fallback = getFallbackInjectedProvider();
+      if (fallback) {
+        onUpdate([
+          {
+            uuid: 'injected-window-ethereum',
+            name: inferInjectedProviderName(fallback),
+            rdns: 'window.ethereum',
+            provider: fallback,
+          },
+        ]);
+        return;
+      }
+    }
+    onUpdate(list);
+  };
+
+  const onAnnounce = (event: Event) => {
+    const custom = event as CustomEvent<{
+      info?: { uuid?: string; name?: string; rdns?: string; icon?: string };
+      provider?: Eip1193Provider;
+    }>;
+    const info = custom.detail?.info;
+    const provider = custom.detail?.provider;
+    if (!info || !provider || typeof provider.request !== 'function') return;
+    const key = info.rdns || info.uuid || info.name || 'wallet';
+    byKey.set(key, {
+      uuid: info.uuid || key,
+      name: info.name || inferInjectedProviderName(provider),
+      rdns: info.rdns || key,
+      icon: info.icon,
+      provider,
+    });
+    emit();
+  };
+
+  window.addEventListener('eip6963:announceProvider', onAnnounce);
+  window.dispatchEvent(new Event('eip6963:requestProvider'));
+  emit();
+
+  return () => {
+    window.removeEventListener('eip6963:announceProvider', onAnnounce);
+  };
+}
+
+async function readArcWalletStateFromProvider(
+  provider: Eip1193Provider,
+  address: string,
+  providerName?: string,
+): Promise<ArcWalletState> {
+  const balanceHex = (await provider.request({
+    method: 'eth_getBalance',
+    params: [address, 'latest'],
+  })) as string;
+
+  let currentChainId = ARC_TESTNET_CHAIN_ID;
+  try {
+    const chainHex = (await provider.request({
+      method: 'eth_chainId',
+    })) as string;
+    if (chainHex) {
+      currentChainId = Number.parseInt(chainHex, 16);
+    }
+  } catch {
+    currentChainId = ARC_TESTNET_CHAIN_ID;
   }
 
+  const rawGas18 = BigInt(balanceHex || '0x0');
+  const gasAmount18 = Amount.fromRaw(rawGas18, 18);
+  const usdcAmount6 = gasTokenToUsdc(ARC_TESTNET_CHAIN_ID, gasAmount18, 'trunc');
+
+  return {
+    mode: 'injected_eip1193',
+    address,
+    chainId: currentChainId,
+    balanceUsdc: usdcAmount6.toFixed(2),
+    balanceRawUsdc6: usdcAmount6.raw,
+    balanceRawGas18: rawGas18,
+    isConnected: true,
+    providerName: providerName || inferInjectedProviderName(provider),
+  };
+}
+
+async function ensureArcTestnetChain(provider: Eip1193Provider): Promise<void> {
   const chainFact = requireChain(ARC_TESTNET_CHAIN_ID);
   const hexChainId = `0x${ARC_TESTNET_CHAIN_ID.toString(16)}`;
-
-  const accounts = (await provider.request({
-    method: 'eth_requestAccounts',
-  })) as string[];
-  if (!accounts || accounts.length === 0) {
-    throw new Error('No wallet account authorized.');
-  }
-  const address = accounts[0];
 
   try {
     await provider.request({
@@ -321,24 +455,179 @@ export async function connectInjectedArcWallet(): Promise<ArcWalletState> {
       ],
     });
   }
+}
 
-  const balanceHex = (await provider.request({
-    method: 'eth_getBalance',
-    params: [address, 'latest'],
-  })) as string;
+/**
+ * Connects to the user's own EIP-6963 or EIP-1193 wallet (MetaMask, Rabby, Coinbase, Phantom, OKX, etc.),
+ * switches/adds Arc Testnet (5042002), and reads their live native 18-decimal USDC balance.
+ */
+export async function connectInjectedArcWallet(
+  selected?: DiscoveredWalletProvider,
+): Promise<ArcWalletState> {
+  const provider = selected?.provider ?? getActiveInjectedProvider();
+  if (!provider) {
+    throw new Error(
+      'No browser wallet detected. Install MetaMask or Rabby, or use Demo Wallet.',
+    );
+  }
 
-  const rawGas18 = BigInt(balanceHex || '0x0');
-  const gasAmount18 = Amount.fromRaw(rawGas18, 18);
-  const usdcAmount6 = gasTokenToUsdc(ARC_TESTNET_CHAIN_ID, gasAmount18, 'trunc');
+  const accounts = (await provider.request({
+    method: 'eth_requestAccounts',
+  })) as string[];
+  if (!accounts || accounts.length === 0) {
+    throw new Error('No wallet account authorized.');
+  }
+  const address = accounts[0];
 
-  return {
-    mode: 'injected_eip1193',
-    address,
-    chainId: ARC_TESTNET_CHAIN_ID,
-    balanceUsdc: usdcAmount6.toFixed(2),
-    balanceRawUsdc6: usdcAmount6.raw,
-    balanceRawGas18: rawGas18,
-    isConnected: true,
+  await ensureArcTestnetChain(provider);
+
+  const name = selected?.name ?? inferInjectedProviderName(provider);
+  activeInjectedProvider = provider;
+  activeInjectedProviderName = name;
+
+  try {
+    localStorage.removeItem(WALLET_DISCONNECTED_FLAG_KEY);
+    if (selected?.rdns) {
+      localStorage.setItem(WALLET_LAST_RDNS_KEY, selected.rdns);
+    }
+  } catch {
+    // Ignore storage errors
+  }
+
+  return readArcWalletStateFromProvider(provider, address, name);
+}
+
+/**
+ * Silently restores an already-authorized browser wallet session via `eth_accounts`
+ * (never triggers a wallet popup). Returns null if disconnected or unauthorized.
+ */
+export async function restoreInjectedArcWallet(
+  discovered: DiscoveredWalletProvider[] = [],
+): Promise<ArcWalletState | null> {
+  try {
+    if (localStorage.getItem(WALLET_DISCONNECTED_FLAG_KEY) === '1') {
+      return null;
+    }
+  } catch {
+    // Continue
+  }
+
+  let preferredRdns: string | null = null;
+  try {
+    preferredRdns = localStorage.getItem(WALLET_LAST_RDNS_KEY);
+  } catch {
+    preferredRdns = null;
+  }
+
+  const orderedCandidates: Array<{ provider: Eip1193Provider; name: string }> = [];
+  if (preferredRdns) {
+    const match = discovered.find((w) => w.rdns === preferredRdns);
+    if (match) {
+      orderedCandidates.push({ provider: match.provider, name: match.name });
+    }
+  }
+  for (const w of discovered) {
+    if (!orderedCandidates.some((c) => c.provider === w.provider)) {
+      orderedCandidates.push({ provider: w.provider, name: w.name });
+    }
+  }
+  const fallback = getFallbackInjectedProvider();
+  if (fallback && !orderedCandidates.some((c) => c.provider === fallback)) {
+    orderedCandidates.push({
+      provider: fallback,
+      name: inferInjectedProviderName(fallback),
+    });
+  }
+
+  for (const candidate of orderedCandidates) {
+    try {
+      const accounts = (await candidate.provider.request({
+        method: 'eth_accounts',
+      })) as string[];
+      if (accounts && accounts.length > 0 && accounts[0]) {
+        activeInjectedProvider = candidate.provider;
+        activeInjectedProviderName = candidate.name;
+        return await readArcWalletStateFromProvider(
+          candidate.provider,
+          accounts[0],
+          candidate.name,
+        );
+      }
+    } catch {
+      // Try next provider
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Refreshes the live Arc Testnet USDC balance for the currently connected personal wallet.
+ */
+export async function refreshInjectedArcWallet(
+  address: string,
+): Promise<ArcWalletState | null> {
+  const provider = getActiveInjectedProvider();
+  if (!provider || !address) return null;
+  try {
+    return await readArcWalletStateFromProvider(
+      provider,
+      address,
+      activeInjectedProviderName,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Disconnects the current wallet session locally so another wallet/account can be connected.
+ */
+export function disconnectArcWallet(): ArcWalletState {
+  activeInjectedProvider = null;
+  activeInjectedProviderName = undefined;
+  try {
+    localStorage.setItem(WALLET_DISCONNECTED_FLAG_KEY, '1');
+  } catch {
+    // Ignore storage error
+  }
+  return createDisconnectedArcWallet();
+}
+
+/**
+ * Subscribes to EIP-1193 `accountsChanged` and `chainChanged` events on the active personal wallet.
+ */
+export function subscribeInjectedWalletEvents(handlers: {
+  onAccountsChanged: (accounts: string[]) => void;
+  onChainChanged: (chainId: number) => void;
+}): () => void {
+  const provider = getActiveInjectedProvider();
+  if (!provider || typeof provider.on !== 'function') return () => {};
+
+  const handleAccounts = (raw: unknown) => {
+    const list = Array.isArray(raw)
+      ? raw.filter((a): a is string => typeof a === 'string')
+      : [];
+    handlers.onAccountsChanged(list);
+  };
+
+  const handleChain = (raw: unknown) => {
+    if (typeof raw === 'string') {
+      const parsed = Number.parseInt(raw, 16);
+      if (Number.isFinite(parsed)) {
+        handlers.onChainChanged(parsed);
+      }
+    } else if (typeof raw === 'number' && Number.isFinite(raw)) {
+      handlers.onChainChanged(raw);
+    }
+  };
+
+  provider.on('accountsChanged', handleAccounts);
+  provider.on('chainChanged', handleChain);
+
+  return () => {
+    provider.removeListener?.('accountsChanged', handleAccounts);
+    provider.removeListener?.('chainChanged', handleChain);
   };
 }
 
@@ -352,10 +641,11 @@ export async function submitInjectedOrionRequest(
   fromAddress: string,
   relayerRewardGas18: Amount,
 ): Promise<string> {
-  const provider = getInjectedProvider();
+  const provider = getActiveInjectedProvider();
   if (!provider) {
     throw new Error('Injected wallet provider not available');
   }
+  await ensureArcTestnetChain(provider);
   // Call `roll()` (selector 0xcd596583) on deployed Orion RandomnessDemo v2 (`0x1e4861248142748d37b3778aae40df133e0ad5d2`)
   // which forwards `msg.value` (in 18-decimal native USDC) to `RandomnessHub v2` (`0xe754e552fae5ba55726f0e97a196ee9e19e2f9d2`).
   const valueHex = `0x${relayerRewardGas18.raw.toString(16)}`;
