@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.gitignore
+.playwright-cli
+.aistudio
+.gemini
+*.log
+*.md
+contracts
+docs
+deploy-cloud-run.sh
+vercel.json
