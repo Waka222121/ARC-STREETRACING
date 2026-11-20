@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import {
   LobbyStartMeta,
   MultiplayerMainMenu,
@@ -47,7 +47,11 @@ import {
   RivalDifficulty,
   TrackId,
 } from './game/types';
-import { LiveHudSnapshot, WorldCanvas } from './game/WorldCanvas';
+import type { LiveHudSnapshot } from './game/WorldCanvas';
+
+const WorldCanvas = lazy(() =>
+  import('./game/WorldCanvas').then((mod) => ({ default: mod.WorldCanvas })),
+);
 
 const INITIAL_HUD: LiveHudSnapshot = {
   speedKmh: 0,
@@ -146,6 +150,45 @@ export default function App() {
   const [recentRaces, setRecentRaces] = useState<RecentRaceSession[]>(() =>
     loadRecentRacesFromStorage(),
   );
+
+  const [shouldMountCanvas, setShouldMountCanvas] = useState<boolean>(false);
+
+  // Mount the 3D WebGL scene during browser idle right after the Lobby paints
+  // so initial load never stalls downloading or compiling Three.js shaders.
+  useEffect(() => {
+    if (shouldMountCanvas) return;
+    if (gameState !== 'title') {
+      setShouldMountCanvas(true);
+      return;
+    }
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    let idleId: number | null = null;
+    const ric = (
+      window as unknown as {
+        requestIdleCallback?: (
+          cb: () => void,
+          opts?: { timeout: number },
+        ) => number;
+        cancelIdleCallback?: (id: number) => void;
+      }
+    ).requestIdleCallback;
+    const cic = (
+      window as unknown as { cancelIdleCallback?: (id: number) => void }
+    ).cancelIdleCallback;
+
+    const rafId = requestAnimationFrame(() => {
+      if (typeof ric === 'function') {
+        idleId = ric(() => setShouldMountCanvas(true), { timeout: 250 });
+      } else {
+        timerId = setTimeout(() => setShouldMountCanvas(true), 180);
+      }
+    });
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (timerId !== null) clearTimeout(timerId);
+      if (idleId !== null && typeof cic === 'function') cic(idleId);
+    };
+  }, [gameState, shouldMountCanvas]);
 
   useEffect(() => {
     document.body.dataset.state = gameState;
@@ -545,26 +588,42 @@ export default function App() {
   }, [handleToggleMute]);
 
   return (
-    <main className="relative w-full h-full overflow-hidden bg-[#56cc5c] select-none touch-manipulation">
-      <WorldCanvas
-        gameState={gameState}
-        carConfig={carConfig}
-        trackId={trackId}
-        rivalDifficulty={rivalDifficulty}
-        garageCameraPreset={garageCameraPreset}
-        raceCameraMode={raceCameraMode}
-        raceSessionId={raceSessionId}
-        lobbySlotOccupancy={lobbySlotOccupancy}
-        lobbySlotColors={lobbySlotColors}
-        onlineMatch={null}
-        onHudUpdate={setHudSnapshot}
-        onRaceFinish={handleRaceFinish}
-        onTogglePause={handleReturnToLobby}
-        onCycleRaceCamera={handleCycleRaceCamera}
-        onStartFromKey={() => {
-          void handleStartRace();
-        }}
-      />
+    <main
+      className={`relative w-full h-full overflow-hidden select-none touch-manipulation ${
+        gameState === 'title' ? 'bg-[#0d0d0f]' : 'bg-[#56cc5c]'
+      }`}
+    >
+      {shouldMountCanvas && (
+        <Suspense
+          fallback={
+            gameState === 'playing' ? (
+              <div className="fixed inset-0 z-10 flex items-center justify-center bg-[#0d0d0f] font-mono text-xs uppercase tracking-[0.2em] text-white/80">
+                Loading 3D Highway...
+              </div>
+            ) : null
+          }
+        >
+          <WorldCanvas
+            gameState={gameState}
+            carConfig={carConfig}
+            trackId={trackId}
+            rivalDifficulty={rivalDifficulty}
+            garageCameraPreset={garageCameraPreset}
+            raceCameraMode={raceCameraMode}
+            raceSessionId={raceSessionId}
+            lobbySlotOccupancy={lobbySlotOccupancy}
+            lobbySlotColors={lobbySlotColors}
+            onlineMatch={null}
+            onHudUpdate={setHudSnapshot}
+            onRaceFinish={handleRaceFinish}
+            onTogglePause={handleReturnToLobby}
+            onCycleRaceCamera={handleCycleRaceCamera}
+            onStartFromKey={() => {
+              void handleStartRace();
+            }}
+          />
+        </Suspense>
+      )}
 
       {gameState === 'title' && (
         <MultiplayerMainMenu

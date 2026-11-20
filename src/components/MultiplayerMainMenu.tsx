@@ -166,19 +166,22 @@ export const MultiplayerMainMenu: React.FC<MultiplayerMainMenuProps> = ({
     useState<OrionHubTelemetry | null>(null);
   const inIframe = useMemo(() => isRunningInIframe(), []);
 
-  // Poll Orion RandomnessHub v2 telemetry from Arc Testnet & drand evmnet
+  // Poll Orion RandomnessHub v2 telemetry from Arc Testnet & drand evmnet after initial paint settles
   useEffect(() => {
     let active = true;
     const loadTelemetry = async () => {
       const data = await fetchOrionHubTelemetry();
       if (active) setOrionTelemetry(data);
     };
-    void loadTelemetry();
+    const startTimer = window.setTimeout(() => {
+      void loadTelemetry();
+    }, 1200);
     const interval = window.setInterval(() => {
       void loadTelemetry();
-    }, 9000);
+    }, 12000);
     return () => {
       active = false;
+      window.clearTimeout(startTimer);
       window.clearInterval(interval);
     };
   }, []);

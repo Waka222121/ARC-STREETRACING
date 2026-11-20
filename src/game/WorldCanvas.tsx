@@ -29,12 +29,12 @@ import {
   TRACK_CATALOG,
 } from './track';
 import {
-  buildTrafficVehicleMesh,
   checkRacerTrafficCollision,
   createInitialTraffic,
   stepTrafficVehicles,
   TrafficVehicle,
 } from './traffic';
+import { buildTrafficVehicleMesh } from './trafficMesh';
 import { computeCarStats, DEFAULT_CAR_CONFIG } from './tuning';
 import {
   CameraPreset,
@@ -178,13 +178,20 @@ function createUnified4LaneHighwayTexture(maxAnisotropy: number): {
     ctx.fillRect(cx - 70, 0, 140, 1024);
   }
 
-  // Fine dry stone grain across the 4-lane highway surface
-  for (let i = 0; i < 9000; i++) {
-    const x = (i * 73) % 1024;
-    const y = (i * 137) % 1024;
-    const v = 26 + ((i * 29) % 24);
-    ctx.fillStyle = `rgb(${v}, ${v + 5}, ${v + 12})`;
-    ctx.fillRect(x, y, 2, 2);
+  // Fine dry stone grain across the 4-lane highway surface (batched into 4 shade buckets for fast startup)
+  const grainShades = [
+    'rgb(28, 33, 40)',
+    'rgb(35, 40, 47)',
+    'rgb(42, 47, 54)',
+    'rgb(49, 54, 61)',
+  ];
+  for (let b = 0; b < grainShades.length; b++) {
+    ctx.fillStyle = grainShades[b];
+    for (let i = b; i < 2400; i += 4) {
+      const x = (i * 73) % 1024;
+      const y = (i * 137) % 1024;
+      ctx.fillRect(x, y, 2, 2);
+    }
   }
 
   // Subtle horizontal concrete expansion joints across the 4 lanes
@@ -861,52 +868,6 @@ function buildContinuousStraightHighway(
   return highwayGroup;
 }
 
-/**
- * Clean minimal showcase platform for the vehicle configuration screen.
- */
-function buildShowcasePlatform(): {
-  stageGroup: THREE.Group;
-  dynoRollers: THREE.Mesh[];
-} {
-  const stageGroup = new THREE.Group();
-  const dynoRollers: THREE.Mesh[] = [];
-
-  const padGeo = new THREE.CylinderGeometry(3.4, 3.6, 0.05, 40);
-  const padMat = new THREE.MeshStandardMaterial({
-    color: 0x111622,
-    metalness: 0.6,
-    roughness: 0.3,
-  });
-  const padMesh = new THREE.Mesh(padGeo, padMat);
-  padMesh.position.y = 0.01;
-  stageGroup.add(padMesh);
-
-  const ringGeo = new THREE.TorusGeometry(3.45, 0.035, 8, 48);
-  ringGeo.rotateX(Math.PI / 2);
-  const ringMat = new THREE.MeshBasicMaterial({ color: 0xff4d00 });
-  const ringMesh = new THREE.Mesh(ringGeo, ringMat);
-  ringMesh.position.y = 0.04;
-  stageGroup.add(ringMesh);
-
-  const rollerMat = new THREE.MeshStandardMaterial({
-    color: 0x94a3b8,
-    metalness: 0.85,
-    roughness: 0.2,
-  });
-  for (const wz of [1.34, -1.32]) {
-    for (const roff of [-0.19, 0.19]) {
-      const rollerGeo = new THREE.CylinderGeometry(0.11, 0.11, 2.3, 14);
-      rollerGeo.rotateZ(Math.PI / 2);
-      const roller = new THREE.Mesh(rollerGeo, rollerMat);
-      roller.position.set(0, -0.02, wz + roff);
-      stageGroup.add(roller);
-      dynoRollers.push(roller);
-    }
-  }
-
-  return { stageGroup, dynoRollers };
-}
-
 export const WorldCanvas: React.FC<WorldCanvasProps> = ({
   gameState,
   carConfig,
@@ -1018,9 +979,18 @@ export const WorldCanvas: React.FC<WorldCanvasProps> = ({
   const postBrakeRampRef = useRef<number>(1);
   const sessionFinishedRef = useRef<boolean>(false);
 
-  const rebuildPlayerCarMesh = () => {
+  const lastPlayerConfigSigRef = useRef<string>('');
+  const lastRivalColorsSigRef = useRef<string>('');
+
+  const rebuildPlayerCarMesh = (force = false) => {
     const scene = sceneRef.current;
     if (!scene) return;
+
+    const cfgSig = JSON.stringify(carConfigRef.current);
+    if (!force && playerCarRigRef.current && lastPlayerConfigSigRef.current === cfgSig) {
+      return;
+    }
+    lastPlayerConfigSigRef.current = cfgSig;
 
     const prevPos = new THREE.Vector3();
     let prevRotY = 0;
@@ -1045,10 +1015,33 @@ export const WorldCanvas: React.FC<WorldCanvasProps> = ({
     playerCarRigRef.current = newRig;
   };
 
-  const rebuildRivalCarMeshes = () => {
+  const rebuildRivalCarMeshes = (force = false) => {
     const scene = sceneRef.current;
     if (!scene) return;
     const racers = racersRef.current;
+    if (racers.length <= 1) {
+      rivalCarRigsRef.current.forEach((rig) => scene.remove(rig.root));
+      rivalCarRigsRef.current = [];
+      lastRivalColorsSigRef.current = '';
+      return;
+    }
+
+    const isOnlineActive =
+      Boolean(onlineMatchRef.current) && gameStateRef.current === 'playing';
+    const rivalColorsSig = isOnlineActive
+      ? racers
+          .slice(1)
+          .map((r) => r.paintColor)
+          .join('|')
+      : lobbySlotColorsRef.current.join('|');
+    if (
+      !force &&
+      rivalCarRigsRef.current.length === racers.length - 1 &&
+      lastRivalColorsSigRef.current === rivalColorsSig
+    ) {
+      return;
+    }
+    lastRivalColorsSigRef.current = rivalColorsSig;
 
     const prevTransforms = rivalCarRigsRef.current.map((rig) => ({
       pos: rig.root.position.clone(),
@@ -1058,11 +1051,8 @@ export const WorldCanvas: React.FC<WorldCanvasProps> = ({
 
     rivalCarRigsRef.current.forEach((rig) => scene.remove(rig.root));
     rivalCarRigsRef.current = [];
-    if (racers.length <= 1) return;
 
     const isLobby = gameStateRef.current === 'title';
-    const isOnlineActive =
-      Boolean(onlineMatchRef.current) && gameStateRef.current === 'playing';
     const occ = lobbySlotOccupancyRef.current;
     const rivalLaneMap: Record<number, 0 | 2 | 3> = { 1: 2, 2: 0, 3: 3 };
 
@@ -1201,23 +1191,28 @@ export const WorldCanvas: React.FC<WorldCanvasProps> = ({
       }
     }
 
-    // Spawn 28 civilian passenger sedans, SUVs, and heavy cargo trucks on the straight 4-lane highway
-    // Uses Orion room seed when online so all 2..4 players see identical deterministic traffic waves
+    // Spawn 28 civilian passenger sedans, SUVs, and heavy cargo trucks on the straight 4-lane highway.
+    // Skip building their 3D meshes while sitting in the Lobby (`isLobby`) to keep first load instant;
+    // build them immediately when a race starts.
     trafficMeshesRef.current.forEach((m) => scene.remove(m));
     trafficMeshesRef.current = [];
-    const trafficList = createInitialTraffic(
-      trackIdRef.current,
-      28,
-      activeOnline?.trafficSeed,
-    );
-    trafficRef.current = trafficList;
-    for (const tv of trafficList) {
-      const tMesh = buildTrafficVehicleMesh(tv);
-      tMesh.position.set(tv.x, isLobby ? -35 : 0, tv.z);
-      tMesh.rotation.y = tv.heading;
-      tMesh.visible = !isLobby;
-      scene.add(tMesh);
-      trafficMeshesRef.current.push(tMesh);
+    if (isLobby) {
+      trafficRef.current = [];
+    } else {
+      const trafficList = createInitialTraffic(
+        trackIdRef.current,
+        28,
+        activeOnline?.trafficSeed,
+      );
+      trafficRef.current = trafficList;
+      for (const tv of trafficList) {
+        const tMesh = buildTrafficVehicleMesh(tv);
+        tMesh.position.set(tv.x, 0, tv.z);
+        tMesh.rotation.y = tv.heading;
+        tMesh.visible = true;
+        scene.add(tMesh);
+        trafficMeshesRef.current.push(tMesh);
+      }
     }
 
     if (playerCarRigRef.current && racers[0]) {
@@ -1324,14 +1319,33 @@ export const WorldCanvas: React.FC<WorldCanvasProps> = ({
         rig.root.visible = isLobby ? occ[laneIdx] : true;
       }
     });
-    const trafficList = trafficRef.current;
-    trafficMeshesRef.current.forEach((tMesh, idx) => {
-      const tv = trafficList[idx];
-      if (tv) {
-        tMesh.position.set(tv.x, isLobby ? -35 : 0, tv.z);
-        tMesh.visible = !isLobby;
+    const scene = sceneRef.current;
+    if (!isLobby && scene && trafficMeshesRef.current.length === 0) {
+      const activeOnline = onlineMatchRef.current;
+      const trafficList = createInitialTraffic(
+        trackIdRef.current,
+        28,
+        activeOnline?.trafficSeed,
+      );
+      trafficRef.current = trafficList;
+      for (const tv of trafficList) {
+        const tMesh = buildTrafficVehicleMesh(tv);
+        tMesh.position.set(tv.x, 0, tv.z);
+        tMesh.rotation.y = tv.heading;
+        tMesh.visible = true;
+        scene.add(tMesh);
+        trafficMeshesRef.current.push(tMesh);
       }
-    });
+    } else {
+      const trafficList = trafficRef.current;
+      trafficMeshesRef.current.forEach((tMesh, idx) => {
+        const tv = trafficList[idx];
+        if (tv) {
+          tMesh.position.set(tv.x, isLobby ? -35 : 0, tv.z);
+          tMesh.visible = !isLobby;
+        }
+      });
+    }
     if (playerCarRigRef.current && racers[0]) {
       const p0 = racers[0];
       playerCarRigRef.current.root.position.y = 0;
@@ -1408,12 +1422,21 @@ export const WorldCanvas: React.FC<WorldCanvasProps> = ({
     scene.background = new THREE.Color(0x56cc5c);
     scene.fog = new THREE.FogExp2(0x56cc5c, 0.0022);
 
-    const pmremGenerator = new THREE.PMREMGenerator(renderer);
-    scene.environment = pmremGenerator.fromScene(
-      new RoomEnvironment(),
-      0.04,
-    ).texture;
-    pmremGenerator.dispose();
+    let envTexture: THREE.Texture | null = null;
+    let pmremTimerId: ReturnType<typeof setTimeout> | null = null;
+    if (!isSoftwareGl) {
+      // Defer RoomEnvironment PMREM cubemap generation until after the first frame paints
+      pmremTimerId = setTimeout(() => {
+        if (!sceneRef.current) return;
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        envTexture = pmremGenerator.fromScene(
+          new RoomEnvironment(),
+          0.04,
+        ).texture;
+        scene.environment = envTexture;
+        pmremGenerator.dispose();
+      }, 150);
+    }
 
     const hemiLight = new THREE.HemisphereLight(0xffffff, 0x56cc5c, 1.05);
     scene.add(hemiLight);
@@ -1466,11 +1489,7 @@ export const WorldCanvas: React.FC<WorldCanvasProps> = ({
     trackGroupRef.current = highwayGroup;
     activeTrackMeshIdRef.current = trackIdRef.current;
 
-    const garageStage = buildShowcasePlatform();
-    scene.add(garageStage.stageGroup);
-    garageStageRef.current = garageStage;
-
-    rebuildPlayerCarMesh();
+    rebuildPlayerCarMesh(true);
     resetRaceGrid();
 
     // Pooled Tire Skidmark Ring Buffer
@@ -2606,6 +2625,9 @@ export const WorldCanvas: React.FC<WorldCanvasProps> = ({
     return () => {
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
+      if (pmremTimerId !== null) clearTimeout(pmremTimerId);
+      if (envTexture) envTexture.dispose();
+      sceneRef.current = null;
       resizeObserver.disconnect();
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
