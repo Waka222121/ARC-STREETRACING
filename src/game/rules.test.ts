@@ -55,7 +55,9 @@ import {
   deriveWinnerLaneFromRandomness,
   DRAND_GENESIS_TIME,
   fetchOrionHubTelemetry,
+  ORION_DEMO_ROLL_SELECTOR,
   ORION_DEMO_V2_ADDRESS,
+  ORION_HUB_NEXT_REQUEST_ID_SELECTOR,
   ORION_HUB_V2_ADDRESS,
   resolveOrionBeaconRandomness,
 } from './arcOrionClient';
@@ -1496,10 +1498,16 @@ test('Arc Studio Onchain Suite: Registry Facts, 6/18-Decimal Money Guards, Custo
   assert.equal(freePracticeWager.playerTotalLockUsdc.toFixed(2), '0.00');
 
   // 4. Live Orion RandomnessHub v2 Telemetry & Beacon Randomness Resolution
+  assert.equal(ORION_DEMO_ROLL_SELECTOR, '0xcd5e3c5d');
+  assert.equal(ORION_HUB_NEXT_REQUEST_ID_SELECTOR, '0x6a84a985');
   const telemetry = await fetchOrionHubTelemetry();
   assert.equal(telemetry.chainId, 5042002);
   assert.equal(telemetry.hubAddress, ORION_HUB_V2_ADDRESS);
   assert.equal(telemetry.demoAddress, ORION_DEMO_V2_ADDRESS);
+  assert.ok(
+    telemetry.nextRequestId !== null && telemetry.nextRequestId > 0n,
+    `Expected live Orion RandomnessHub v2 nextRequestId > 0n, got ${telemetry.nextRequestId}`,
+  );
   assert.ok(
     (telemetry.latestDrandRound ?? 0) > 1_000_000,
     `Current drand evmnet round should exceed 1,000,000, got ${telemetry.latestDrandRound}`,

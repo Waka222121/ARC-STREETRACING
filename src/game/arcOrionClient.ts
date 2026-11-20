@@ -668,6 +668,14 @@ export async function ensureArcTestnetChain(
           },
         ],
       });
+      try {
+        await provider.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: hexChainId }],
+        });
+      } catch {
+        // Some wallets switch automatically on wallet_addEthereumChain
+      }
       return true;
     } catch {
       return false;
@@ -916,10 +924,42 @@ export function subscribeInjectedWalletEvents(handlers: {
 }
 
 /**
- * Sends a real `requestRandomness(120000)` transaction to Orion `RandomnessHub v2`
- * (`0xe754e552fae5ba55726f0e97a196ee9e19e2f9d2`) on Arc Testnet when using an injected wallet.
- * Function selector for `requestRandomness(uint32)`:
- * keccak256("requestRandomness(uint32)")[0..4] = 0x165c4a16 (or `roll()` on Demo v2 = 0xcd596583)
+ * Verified 4-byte function selectors on Arc Testnet (chainId 5042002):
+ * - `roll()` on Orion RandomnessDemo v2 (`0x1e4861248142748d37b3778aae40df133e0ad5d2`): keccak256("roll()")[0..4] = 0xcd5e3c5d
+ * - `nextRequestId()` on Orion RandomnessHub v2 (`0xe754e552fae5ba55726f0e97a196ee9e19e2f9d2`): 0x6a84a985
+ */
+export const ORION_DEMO_ROLL_SELECTOR = '0xcd5e3c5d';
+export const ORION_HUB_NEXT_REQUEST_ID_SELECTOR = '0x6a84a985';
+
+function formatWalletTxError(err: unknown): string {
+  const e = err as {
+    code?: number;
+    shortMessage?: string;
+    message?: string;
+    data?: { message?: string };
+  };
+  if (e?.code === 4001) {
+    return 'Transaction cancelled in wallet.';
+  }
+  const raw =
+    e?.shortMessage ||
+    e?.data?.message ||
+    e?.message ||
+    (err instanceof Error ? err.message : '');
+  if (/insufficient funds|exceeds balance/i.test(raw)) {
+    return 'Insufficient Arc Testnet USDC for 0.02 USDC Orion relayer fee + gas — claim test USDC at faucet.circle.com.';
+  }
+  if (raw) {
+    return raw.length > 160 ? `${raw.slice(0, 157)}...` : raw;
+  }
+  return 'Could not submit Orion transaction in wallet.';
+}
+
+/**
+ * Sends a real `roll()` (`0xcd5e3c5d`) transaction to Orion `RandomnessDemo v2`
+ * (`0x1e4861248142748d37b3778aae40df133e0ad5d2`) on Arc Testnet when using an injected wallet.
+ * The contract forwards `msg.value` (in 18-decimal native USDC) to `RandomnessHub v2`
+ * (`0xe754e552fae5ba55726f0e97a196ee9e19e2f9d2`) as the relayer reward (min 0.01 USDC).
  */
 export async function submitInjectedOrionRequest(
   fromAddress: string,
@@ -935,22 +975,58 @@ export async function submitInjectedOrionRequest(
       `Please switch your wallet to Arc Testnet (${ARC_TESTNET_CHAIN_ID}) to submit the wager tx.`,
     );
   }
-  // Call `roll()` (selector 0xcd596583) on deployed Orion RandomnessDemo v2 (`0x1e4861248142748d37b3778aae40df133e0ad5d2`)
-  // which forwards `msg.value` (in 18-decimal native USDC) to `RandomnessHub v2` (`0xe754e552fae5ba55726f0e97a196ee9e19e2f9d2`).
-  const valueHex = `0x${relayerRewardGas18.raw.toString(16)}`;
-  const txHash = (await provider.request({
-    method: 'eth_sendTransaction',
-    params: [
-      {
-        from: fromAddress,
-        to: ORION_DEMO_V2_ADDRESS,
-        value: valueHex,
-        data: '0xcd596583',
-      },
-    ],
-  })) as string;
 
-  return txHash;
+  // Ensure the `from` address matches the wallet's currently active authorized account
+  let activeFrom = fromAddress;
+  try {
+    const accounts = (await provider.request({
+      method: 'eth_accounts',
+    })) as string[];
+    if (accounts && accounts.length > 0 && accounts[0]) {
+      activeFrom = accounts[0];
+    }
+  } catch {
+    // Keep provided fromAddress
+  }
+
+  const valueHex = `0x${relayerRewardGas18.raw.toString(16)}`;
+  const txBase = {
+    from: activeFrom,
+    to: ORION_DEMO_V2_ADDRESS,
+    value: valueHex,
+    data: ORION_DEMO_ROLL_SELECTOR,
+  };
+
+  // Estimate gas cleanly with a 25% buffer (minimum 180,000 gas) so wallets never fail on tight gas limits
+  let gasHex = '0x35b60'; // 220,000 safe default fallback
+  try {
+    const estimatedHex = (await provider.request({
+      method: 'eth_estimateGas',
+      params: [txBase],
+    })) as string;
+    if (estimatedHex && estimatedHex.startsWith('0x')) {
+      const estimated = BigInt(estimatedHex);
+      const buffered = (estimated * 125n) / 100n;
+      const finalGas = buffered > 180_000n ? buffered : 180_000n;
+      gasHex = `0x${finalGas.toString(16)}`;
+    }
+  } catch (estimateErr) {
+    const msg = formatWalletTxError(estimateErr);
+    if (/insufficient/i.test(msg)) {
+      throw new Error(msg);
+    }
+    // Otherwise let eth_sendTransaction proceed with the safe 220k gas limit
+  }
+
+  try {
+    const txHash = (await provider.request({
+      method: 'eth_sendTransaction',
+      params: [{ ...txBase, gas: gasHex }],
+    })) as string;
+    return txHash;
+  } catch (err) {
+    throw new Error(formatWalletTxError(err));
+  }
 }
 
 /**
@@ -965,7 +1041,7 @@ export async function fetchOrionHubTelemetry(): Promise<OrionHubTelemetry> {
   let latestDrandRound: number | null = null;
   let latestDrandSignatureHex: string | null = null;
 
-  // 1. Query `nextRequestId()` (selector 0x61b8ce8c) on RandomnessHub v2 on Arc Testnet
+  // 1. Query `nextRequestId()` (selector 0x6a84a985) on RandomnessHub v2 on Arc Testnet
   try {
     const rpcRes = await fetch(rpcUrl, {
       method: 'POST',
@@ -977,7 +1053,7 @@ export async function fetchOrionHubTelemetry(): Promise<OrionHubTelemetry> {
         params: [
           {
             to: ORION_HUB_V2_ADDRESS,
-            data: '0x61b8ce8c',
+            data: ORION_HUB_NEXT_REQUEST_ID_SELECTOR,
           },
           'latest',
         ],
